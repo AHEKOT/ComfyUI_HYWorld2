@@ -60,6 +60,38 @@ def check_compiler():
 
     return nvcc_ok, cl_ok
 
+def _patch_lidar(build_dir: Path):
+    """Remove IntersectTileLidar.cu and its references — it fails to compile on CUDA 13+."""
+    import re
+
+    cu_file = build_dir / "gsplat" / "cuda" / "csrc" / "IntersectTileLidar.cu"
+    if cu_file.exists():
+        print("[INFO] Patching: removing IntersectTileLidar.cu (CUDA 13+ incompatible)")
+        cu_file.unlink()
+
+    # Remove from setup.py / ext_modules source list
+    setup_py = build_dir / "setup.py"
+    if setup_py.exists():
+        text = setup_py.read_text(encoding="utf-8")
+        patched = re.sub(r'[^\n]*IntersectTileLidar\.cu[^\n]*\n?', '', text)
+        if patched != text:
+            setup_py.write_text(patched, encoding="utf-8")
+            print("[INFO] Patching: removed IntersectTileLidar.cu from setup.py")
+
+    # Also check gsplat/_cuda_lib.py or similar
+    for candidate in build_dir.rglob("*.py"):
+        if candidate.name.startswith("_cuda") or candidate.name == "setup.py":
+            continue
+        try:
+            text = candidate.read_text(encoding="utf-8", errors="ignore")
+            if "IntersectTileLidar" in text:
+                patched = re.sub(r'[^\n]*IntersectTileLidar[^\n]*\n?', '', text)
+                candidate.write_text(patched, encoding="utf-8")
+                print(f"[INFO] Patching: removed IntersectTileLidar reference from {candidate.name}")
+        except Exception:
+            pass
+
+
 def build_gsplat():
     print("\n==================================================")
     print("   Safe gsplat Installer (Surgical Mode)")
@@ -73,6 +105,21 @@ def build_gsplat():
         print("[ERROR] CUDA not found! gsplat requires a CUDA-enabled PyTorch.")
         sys.exit(1)
     print(f"[OK] PyTorch CUDA: {cuda_ver}")
+
+    # Check system NVCC version — gsplat does not yet support CUDA 13+
+    try:
+        nvcc_out = subprocess.check_output("nvcc --version", shell=True, stderr=subprocess.STDOUT).decode()
+        import re
+        m = re.search(r"release (\d+)\.(\d+)", nvcc_out)
+        if m:
+            nvcc_major = int(m.group(1))
+            if nvcc_major >= 13:
+                print(f"\n[WARN] System CUDA Toolkit {m.group(1)}.{m.group(2)} detected.")
+                print("[WARN] gsplat does not yet support CUDA 13+. Source compilation will likely fail.")
+                print("[WARN] Install CUDA Toolkit 12.x to build from source:")
+                print("[WARN]   https://developer.nvidia.com/cuda-toolkit-archive")
+    except Exception:
+        pass
 
     nvcc_ok, cl_ok = check_compiler()
 
@@ -102,22 +149,27 @@ def build_gsplat():
             print("[ERROR] Failed to download compiler. Please install Visual Studio Build Tools manually.")
             sys.exit(1)
 
-    # Check for pre-built wheel
+    # Check for pre-built wheel — try multiple URL formats
     print("\n[INFO] Checking for pre-built wheel...")
-    try:
-        pt_tag = f"pt{torch.__version__.split('+')[0].replace('.', '')[:2]}"
-        cu_tag = f"cu{cuda_ver.replace('.', '')}"
-        index_url = f"https://docs.gsplat.studio/whl/{pt_tag}{cu_tag}"
+    cu_tag = f"cu{cuda_ver.replace('.', '')}"
+    pt_ver = torch.__version__.split('+')[0].replace('.', '')
+    pt_tag = f"pt{pt_ver[:2]}"
 
+    wheel_urls = [
+        f"https://docs.gsplat.studio/whl/{cu_tag}",
+        f"https://docs.gsplat.studio/whl/{pt_tag}{cu_tag}",
+        f"https://docs.gsplat.studio/whl/nightly/{cu_tag}",
+    ]
+
+    for index_url in wheel_urls:
+        print(f"[INFO] Trying: {index_url}")
         cmd = f"{sys.executable} -m pip install gsplat --index-url {index_url} --no-deps"
         if run_command(cmd, check=False) == 0:
             print("[OK] Installed from official wheel!")
             verify_install()
             return
-    except:
-        pass
 
-    print("[INFO] Official wheel not found or incompatible. Proceeding to build from source...")
+    print("[INFO] No pre-built wheel found. Proceeding to build from source...")
 
     # Clone source
     build_dir = script_dir / "gsplat_build"
@@ -127,12 +179,16 @@ def build_gsplat():
     else:
         print("[INFO] Source cache found.")
 
+    # Patch: remove IntersectTileLidar.cu and its references — incompatible with CUDA 13+
+    _patch_lidar(build_dir)
+
     # Build wheel
     print("\n[INFO] Compiling gsplat...")
     dist_dir = script_dir / "dist"
     dist_dir.mkdir(exist_ok=True)
 
     env = os.environ.copy()
+    env["GSPLAT_NO_LIDAR"] = "1"
 
     try: import ninja
     except:
@@ -150,7 +206,8 @@ def build_gsplat():
             activator = vcvars[0]
         else:
             print("[INFO] Initializing Portable MSVC...")
-            subprocess.check_call(f'"{msvc_dir}/MSVC-Portable.bat"', shell=True, cwd=str(msvc_dir))
+            subprocess.check_call(f'"{msvc_dir}/MSVC-Portable.bat"', shell=True, cwd=str(msvc_dir),
+                                  stdin=subprocess.DEVNULL)
             vcvars = list(msvc_installed.rglob("vcvars64.bat"))
             if vcvars: activator = vcvars[0]
 
