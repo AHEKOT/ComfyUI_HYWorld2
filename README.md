@@ -134,3 +134,7 @@ Example workflows are in the `workflows/` directory:
 - Python 3.10+
 - PyTorch with CUDA
 - NVIDIA GPU (gsplat rendering requires CUDA)
+- Flash Attention — required for HY-World 2.0 model inference. Install via:
+  ```
+  pip install flash-attn --no-build-isolation
+  ```
