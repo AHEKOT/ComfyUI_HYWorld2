@@ -1,0 +1,779 @@
+{
+  "id": "a475170d-64ff-48a7-af40-7ea51b95ca15",
+  "revision": 0,
+  "last_node_id": 17,
+  "last_link_id": 20,
+  "nodes": [
+    {
+      "id": 3,
+      "type": "VNCCS_WorldMirror3D",
+      "pos": [
+        1830,
+        5740
+      ],
+      "size": [
+        330,
+        470
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "WORLDMIRROR_MODEL",
+          "link": 1
+        },
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 2
+        },
+        {
+          "name": "camera_intrinsics",
+          "shape": 7,
+          "type": "TENSOR",
+          "link": 3
+        },
+        {
+          "name": "camera_poses",
+          "shape": 7,
+          "type": "TENSOR",
+          "link": 4
+        }
+      ],
+      "outputs": [
+        {
+          "name": "ply_data",
+          "type": "PLY_DATA",
+          "links": [
+            5
+          ]
+        },
+        {
+          "name": "depth_maps",
+          "type": "IMAGE",
+          "links": []
+        },
+        {
+          "name": "normal_maps",
+          "type": "IMAGE",
+          "links": []
+        },
+        {
+          "name": "camera_poses",
+          "type": "TENSOR",
+          "links": null
+        },
+        {
+          "name": "camera_intrinsics",
+          "type": "TENSOR",
+          "links": null
+        },
+        {
+          "name": "raw_splats",
+          "type": "VNCCS_SPLAT",
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VNCCS_WorldMirror3D",
+        "cnr_id": "vnccs",
+        "ver": "87443c3eda651317f39a8be7fd40a1c868565134"
+      },
+      "widgets_values": [
+        true,
+        518,
+        "sequential_cpu_offload",
+        "panorama_lock",
+        100,
+        false,
+        true,
+        5,
+        0.03,
+        0.4,
+        true,
+        true,
+        0.02,
+        "Ultra"
+      ]
+    },
+    {
+      "id": 4,
+      "type": "VNCCS_SavePLY",
+      "pos": [
+        2230,
+        5620
+      ],
+      "size": [
+        270,
+        180
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ply_data",
+          "type": "PLY_DATA",
+          "link": 5
+        }
+      ],
+      "outputs": [
+        {
+          "name": "filepath",
+          "type": "STRING",
+          "links": [
+            6
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VNCCS_SavePLY",
+        "cnr_id": "vnccs",
+        "ver": "87443c3eda651317f39a8be7fd40a1c868565134"
+      },
+      "widgets_values": [
+        "output",
+        false,
+        true,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "id": 5,
+      "type": "VNCCS_BackgroundPreview",
+      "pos": [
+        2330,
+        6070
+      ],
+      "size": [
+        1160,
+        690
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ply_path",
+          "shape": 7,
+          "type": "STRING",
+          "link": 6
+        },
+        {
+          "name": "extrinsics",
+          "shape": 7,
+          "type": "EXTRINSICS",
+          "link": null
+        },
+        {
+          "name": "intrinsics",
+          "shape": 7,
+          "type": "INTRINSICS",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video_path",
+          "type": "STRING",
+          "links": null
+        },
+        {
+          "name": "ply_path",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VNCCS_BackgroundPreview",
+        "cnr_id": "vnccs",
+        "ver": "87443c3eda651317f39a8be7fd40a1c868565134"
+      },
+      "widgets_values": [
+        "1024",
+        ""
+      ]
+    },
+    {
+      "id": 12,
+      "type": "VNCCS_SavePLY",
+      "pos": [
+        2300,
+        7110
+      ],
+      "size": [
+        270,
+        180
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ply_data",
+          "type": "PLY_DATA",
+          "link": 13
+        }
+      ],
+      "outputs": [
+        {
+          "name": "filepath",
+          "type": "STRING",
+          "links": [
+            18
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VNCCS_SavePLY",
+        "cnr_id": "vnccs",
+        "ver": "87443c3eda651317f39a8be7fd40a1c868565134"
+      },
+      "widgets_values": [
+        "output",
+        false,
+        true,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "id": 13,
+      "type": "VNCCS_LoadWorldMirrorV2Model",
+      "pos": [
+        1260,
+        7080
+      ],
+      "size": [
+        310,
+        90
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "WORLDMIRROR_MODEL",
+          "links": [
+            14
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VNCCS_LoadWorldMirrorV2Model"
+      },
+      "widgets_values": [
+        "cuda",
+        "bf16"
+      ]
+    },
+    {
+      "id": 16,
+      "type": "VNCCS_BackgroundPreview",
+      "pos": [
+        2280,
+        7380
+      ],
+      "size": [
+        1160,
+        690
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ply_path",
+          "shape": 7,
+          "type": "STRING",
+          "link": 18
+        },
+        {
+          "name": "extrinsics",
+          "shape": 7,
+          "type": "EXTRINSICS",
+          "link": null
+        },
+        {
+          "name": "intrinsics",
+          "shape": 7,
+          "type": "INTRINSICS",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video_path",
+          "type": "STRING",
+          "links": []
+        },
+        {
+          "name": "ply_path",
+          "type": "STRING",
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VNCCS_BackgroundPreview",
+        "cnr_id": "vnccs",
+        "ver": "87443c3eda651317f39a8be7fd40a1c868565134"
+      },
+      "widgets_values": [
+        "1024",
+        ""
+      ]
+    },
+    {
+      "id": 17,
+      "type": "LoadImage",
+      "pos": [
+        320,
+        6610
+      ],
+      "size": [
+        290,
+        320
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            19,
+            20
+          ]
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "title": "Load Panorama",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.17.0",
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        " -10 (1).jpg",
+        "image"
+      ]
+    },
+    {
+      "id": 14,
+      "type": "VNCCS_Equirect360ToViews",
+      "pos": [
+        1260,
+        7280
+      ],
+      "size": [
+        300,
+        320
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "panorama",
+          "type": "IMAGE",
+          "link": 20
+        }
+      ],
+      "outputs": [
+        {
+          "name": "views",
+          "type": "IMAGE",
+          "links": [
+            15
+          ]
+        },
+        {
+          "name": "intrinsics",
+          "type": "TENSOR",
+          "links": [
+            16
+          ]
+        },
+        {
+          "name": "camera_poses",
+          "type": "TENSOR",
+          "links": [
+            17
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VNCCS_Equirect360ToViews",
+        "cnr_id": "vnccs",
+        "ver": "87443c3eda651317f39a8be7fd40a1c868565134"
+      },
+      "widgets_values": [
+        "Standard (518)",
+        90,
+        45,
+        "0",
+        518,
+        true,
+        false,
+        false,
+        2.2,
+        0
+      ]
+    },
+    {
+      "id": 15,
+      "type": "VNCCS_WorldMirrorV2_3D",
+      "pos": [
+        1700,
+        7110
+      ],
+      "size": [
+        350,
+        330
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "WORLDMIRROR_MODEL",
+          "link": 14
+        },
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 15
+        },
+        {
+          "name": "camera_intrinsics",
+          "shape": 7,
+          "type": "TENSOR",
+          "link": 16
+        },
+        {
+          "name": "camera_poses",
+          "shape": 7,
+          "type": "TENSOR",
+          "link": 17
+        }
+      ],
+      "outputs": [
+        {
+          "name": "ply_data",
+          "type": "PLY_DATA",
+          "links": [
+            13
+          ]
+        },
+        {
+          "name": "depth_maps",
+          "type": "IMAGE",
+          "links": []
+        },
+        {
+          "name": "normal_maps",
+          "type": "IMAGE",
+          "links": []
+        },
+        {
+          "name": "camera_poses",
+          "type": "TENSOR",
+          "links": []
+        },
+        {
+          "name": "camera_intrinsics",
+          "type": "TENSOR",
+          "links": []
+        },
+        {
+          "name": "raw_splats",
+          "type": "VNCCS_SPLAT",
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VNCCS_WorldMirrorV2_3D"
+      },
+      "widgets_values": [
+        true,
+        518,
+        "none",
+        10,
+        false,
+        true,
+        1,
+        0.03
+      ]
+    },
+    {
+      "id": 2,
+      "type": "VNCCS_Equirect360ToViews",
+      "pos": [
+        1220,
+        6020
+      ],
+      "size": [
+        300,
+        320
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "panorama",
+          "type": "IMAGE",
+          "link": 19
+        }
+      ],
+      "outputs": [
+        {
+          "name": "views",
+          "type": "IMAGE",
+          "links": [
+            2
+          ]
+        },
+        {
+          "name": "intrinsics",
+          "type": "TENSOR",
+          "links": [
+            3
+          ]
+        },
+        {
+          "name": "camera_poses",
+          "type": "TENSOR",
+          "links": [
+            4
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VNCCS_Equirect360ToViews",
+        "cnr_id": "vnccs",
+        "ver": "87443c3eda651317f39a8be7fd40a1c868565134"
+      },
+      "widgets_values": [
+        "Standard (518)",
+        90,
+        45,
+        "0",
+        518,
+        true,
+        false,
+        false,
+        2.2,
+        0
+      ]
+    },
+    {
+      "id": 1,
+      "type": "VNCCS_LoadWorldMirrorModel",
+      "pos": [
+        1260,
+        5660
+      ],
+      "size": [
+        300,
+        160
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "WORLDMIRROR_MODEL",
+          "links": [
+            1
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VNCCS_LoadWorldMirrorModel",
+        "cnr_id": "vnccs",
+        "ver": "87443c3eda651317f39a8be7fd40a1c868565134"
+      },
+      "widgets_values": [
+        "cuda",
+        "conservative",
+        false,
+        30
+      ]
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      3,
+      0,
+      "WORLDMIRROR_MODEL"
+    ],
+    [
+      2,
+      2,
+      0,
+      3,
+      1,
+      "IMAGE"
+    ],
+    [
+      3,
+      2,
+      1,
+      3,
+      2,
+      "TENSOR"
+    ],
+    [
+      4,
+      2,
+      2,
+      3,
+      3,
+      "TENSOR"
+    ],
+    [
+      5,
+      3,
+      0,
+      4,
+      0,
+      "PLY_DATA"
+    ],
+    [
+      6,
+      4,
+      0,
+      5,
+      0,
+      "STRING"
+    ],
+    [
+      13,
+      15,
+      0,
+      12,
+      0,
+      "PLY_DATA"
+    ],
+    [
+      14,
+      13,
+      0,
+      15,
+      0,
+      "WORLDMIRROR_MODEL"
+    ],
+    [
+      15,
+      14,
+      0,
+      15,
+      1,
+      "IMAGE"
+    ],
+    [
+      16,
+      14,
+      1,
+      15,
+      2,
+      "TENSOR"
+    ],
+    [
+      17,
+      14,
+      2,
+      15,
+      3,
+      "TENSOR"
+    ],
+    [
+      18,
+      12,
+      0,
+      16,
+      0,
+      "STRING"
+    ],
+    [
+      19,
+      17,
+      0,
+      2,
+      0,
+      "IMAGE"
+    ],
+    [
+      20,
+      17,
+      0,
+      14,
+      0,
+      "IMAGE"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "World-Mirror",
+      "bounding": [
+        1210,
+        5550,
+        2290,
+        1223.6
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 2,
+      "title": "HY-World2.0",
+      "bounding": [
+        1240,
+        7000,
+        2210,
+        1073.6
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.612736446457985,
+      "offset": [
+        747.5111021626228,
+        -5586.053873605599
+      ]
+    },
+    "frontendVersion": "1.41.21",
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true
+  },
+  "version": 0.4
+}
