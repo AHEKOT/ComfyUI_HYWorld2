@@ -1212,7 +1212,10 @@ def extract_splat_params(data):
             colors_data = colors_data.detach().cpu().float()
             
             # DEBUG: Color Stats
-            print(f"🎨 [extract_splat_params] Colors Stats: Min={colors_data.min():.3f}, Max={colors_data.max():.3f}, Mean={colors_data.mean():.3f}")
+            if colors_data.numel() > 0:
+                print(f"🎨 [extract_splat_params] Colors Stats: Min={colors_data.min():.3f}, Max={colors_data.max():.3f}, Mean={colors_data.mean():.3f}")
+            else:
+                print("🎨 [extract_splat_params] Colors Stats: empty tensor")
         else:
             colors_data = torch.ones(N, 3) * 0.5
         

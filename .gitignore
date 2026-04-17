@@ -417,4 +417,5 @@ FodyWeavers.xsd
 *.msm
 *.msp
 *.DS_Store
-node.zip
+node.zip.worktrees/
+.pytest_cache
