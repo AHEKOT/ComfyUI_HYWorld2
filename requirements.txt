@@ -34,6 +34,20 @@ typeguard
 # CPU offloading (optional, for model_cpu_offload)
 accelerate
 
+# PyTorch3D (required for WorldStereo point rendering) — install manually:
+# pip install "git+https://github.com/facebookresearch/pytorch3d.git@stable"
+
+# MoGe depth estimator (required for WorldStereo) — install manually:
+# pip install "git+https://github.com/microsoft/MoGe.git"
+
+# WorldStereo
+diffusers>=0.36.0
+transformers>=4.40.0
+bitsandbytes>=0.43.0
+optimum-quanto>=0.2.4
+imageio[ffmpeg]
+kornia
+
 # Sky segmentation ONNX fallback (optional)
 # onnxruntime
 
