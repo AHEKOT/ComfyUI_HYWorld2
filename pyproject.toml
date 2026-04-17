@@ -28,6 +28,6 @@ video = ["moviepy==1.0.3"]
 skyseg = ["onnxruntime"]
 
 [tool.comfy]
-PublisherId = "hyworld2"
+PublisherId = "vnccs-hyworld2"
 DisplayName = "HY-World 2.0 — WorldMirror 3D"
 Icon = ""
