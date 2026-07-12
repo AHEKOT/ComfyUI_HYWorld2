@@ -1068,6 +1068,15 @@ class PanoramaMemoryBank:
 
         # Downsample frames that need updates in the memory bank, skipping the first frame.
         nframe = len(gen_frames)
+        if nframe <= 1:
+            # The first frame is intentionally not inserted because it is already
+            # represented by the trajectory/start-frame memory. A one-frame Klein
+            # result therefore has no new frame to align, which is valid.
+            rank0_log(
+                f"Skip memory update for {view_id}/{traj_id}: "
+                f"generated trajectory has only {nframe} frame(s)."
+            )
+            return
         effective_align_nframe = min(self.align_nframe, max(1, nframe - 1))
         indices = sample_align_nframe(nframe, effective_align_nframe)
         updated_tar_w2cs = tar_w2cs_full[indices]

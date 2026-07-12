@@ -19,12 +19,10 @@ try:
     from .src.general_utils import set_seed, Timer, rank0_log
     from .src.distributed_compat import distributed_backend
     from .src.pointcloud import multi_gpu_point_rendering
-    from .src.vlm_utils import get_traj_caption
 except ImportError:
     from src.general_utils import set_seed, Timer, rank0_log
     from src.distributed_compat import distributed_backend
     from src.pointcloud import multi_gpu_point_rendering
-    from src.vlm_utils import get_traj_caption
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 timer = Timer()
@@ -36,6 +34,10 @@ LLM_PORT = 8000
 
 def caption_single_video(args):
     """Caption one rendered video."""
+    try:
+        from .src.vlm_utils import get_traj_caption
+    except ImportError:
+        from src.vlm_utils import get_traj_caption
     render_path, llm_addr, llm_port, model_name, caption_sample_count, caption_max_tokens = args
     output_path = str(Path(render_path).with_name("traj_caption.json"))
 
@@ -85,6 +87,21 @@ def _render_barrier(world_size):
         dist.barrier()
 
 
+def _voxel_downsample_point_cloud(point_cloud, voxel_size):
+    """Deterministically keep one representative per occupied voxel."""
+    voxel_size = float(voxel_size)
+    if voxel_size <= 0 or len(point_cloud.vertices) == 0:
+        return point_cloud
+    vertices = np.asarray(point_cloud.vertices)
+    origin = vertices.min(axis=0)
+    voxel_keys = np.floor((vertices - origin) / voxel_size).astype(np.int64)
+    _, indices = np.unique(voxel_keys, axis=0, return_index=True)
+    indices.sort()
+    colors = np.asarray(point_cloud.colors)
+    sampled_colors = colors[indices] if len(colors) == len(vertices) else None
+    return trimesh.PointCloud(vertices=vertices[indices], colors=sampled_colors)
+
+
 def build_arg_parser():
 
     parser = argparse.ArgumentParser()
@@ -113,9 +130,9 @@ def run_traj_render(args, rank=0, world_size=1, local_rank=0):
     global LLM_ADDR, LLM_PORT, MODEL_NAME, timer
 
     # Override globals with argparse values
-    LLM_ADDR = args.llm_addr
-    LLM_PORT = args.llm_port
-    MODEL_NAME = args.llm_name
+    LLM_ADDR = getattr(args, "llm_addr", LLM_ADDR)
+    LLM_PORT = getattr(args, "llm_port", LLM_PORT)
+    MODEL_NAME = getattr(args, "llm_name", MODEL_NAME)
     timer = Timer()
 
     rank = int(rank)
@@ -151,6 +168,14 @@ def run_traj_render(args, rank=0, world_size=1, local_rank=0):
         # Load the global point cloud once per scene.
         with timer.track("[IO] Loading point cloud for rendering"):
             global_pcd = trimesh.load(f"{scene_path}/render_results/global_pcd.ply")
+            voxel_size = max(0.0, float(getattr(args, "global_pcd_voxel_size", 0.0)))
+            original_point_count = len(global_pcd.vertices)
+            global_pcd = _voxel_downsample_point_cloud(global_pcd, voxel_size)
+            if voxel_size > 0:
+                rank0_log(
+                    f"Render-only global_pcd downsample: {original_point_count} -> "
+                    f"{len(global_pcd.vertices)} points (voxel_size={voxel_size:g})"
+                )
 
         for traj_path in tqdm(traj_list, desc="Rendering Trajectories...", disable=rank != 0):
             if not os.path.exists(f"{traj_path}/camera.json"):
@@ -178,7 +203,8 @@ def run_traj_render(args, rank=0, world_size=1, local_rank=0):
                                                                   render_colors=global_pcd.colors[:, :3] / 255 * 2 - 1,  # [-1~1]
                                                                   image_h=image_h, image_w=image_w,
                                                                   device=device, device_num=device_num,
-                                                                  render_radius=0.008, points_per_pixel=20,
+                                                                  render_radius=0.008,
+                                                                  points_per_pixel=max(1, int(getattr(args, "points_per_pixel", 20))),
                                                                   slice_size=4, local_rank=local_rank, replace_first_frame=replace_first_frame)
 
             _render_barrier(world_size)
@@ -197,7 +223,7 @@ def run_traj_render(args, rank=0, world_size=1, local_rank=0):
 
         # Caption rendered trajectories with concurrent vLLM requests.
         if rank == 0:
-            if args.disable_vlm_caption:
+            if getattr(args, "disable_vlm_caption", False):
                 # TEMPORARY TEST MODE: VLM/LLM captions are disabled here.
                 # Re-enable VLM captions for production runs so each trajectory gets a real prompt.
                 rank0_log("VLM trajectory captioning is disabled; WorldStereo must receive manual traj prompts.", "WARNING")

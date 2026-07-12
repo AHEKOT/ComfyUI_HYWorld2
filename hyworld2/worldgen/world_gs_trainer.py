@@ -1959,6 +1959,28 @@ class Runner:
         device = self.device
         world_rank = self.world_rank
 
+        val_count = len(self.valset)
+        if val_count == 0:
+            # A small or filtered dataset can legitimately put every image in the
+            # training split. Evaluation is optional and must not invalidate a
+            # completed checkpoint/PLY save with a division-by-zero failure.
+            if world_rank == 0:
+                print(
+                    f"[WARNING] Skipping {stage} evaluation at step {step}: "
+                    "validation dataset is empty. Check test_every/dataset split if metrics are required."
+                )
+                with open(f"{self.stats_dir}/{stage}_step{step:04d}.json", "w") as f:
+                    json.dump(
+                        {
+                            "skipped": True,
+                            "reason": "empty_validation_dataset",
+                            "num_val_images": 0,
+                            "num_GS": len(self.splats["means"]),
+                        },
+                        f,
+                    )
+            return
+
         valloader = torch.utils.data.DataLoader(
             self.valset,
             batch_size=1,

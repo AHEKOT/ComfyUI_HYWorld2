@@ -403,10 +403,10 @@ def _hyworld2_trajectory_cache_status(
     state_signature = state.get("settings_signature")
     repair_state = False
     if state_signature != settings_signature:
-        if workspace_says_unchanged:
-            repair_state = True
-        else:
-            return False, "trajectory settings changed", state
+        # An unchanged panorama only validates geometry derived from the source
+        # image. It must never bless cameras/renders produced with different
+        # trajectory settings (resolution, FOV, frame count, anchor options...).
+        return False, "trajectory settings changed", state
     if not pano_matches and workspace_says_unchanged:
         repair_state = True
     if repair_state:
@@ -1259,20 +1259,15 @@ def _encode_prompt_cache(pipeline, prompt, negative_prompt, do_classifier_free_g
             max_sequence_length=512,
             device=torch.device(execution_device),
         )
-    if hasattr(pipeline, "maybe_free_model_hooks"):
-        with contextlib.suppress(Exception):
-            pipeline.maybe_free_model_hooks()
     prompt_embeds = prompt_embeds.detach().to("cpu")
     if negative_prompt_embeds is not None:
         negative_prompt_embeds = negative_prompt_embeds.detach().to("cpu")
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
     return prompt_embeds, negative_prompt_embeds
 
 
 def _build_prompt_cache(worldstereo_model, workspace, render_list, model_type, device):
     prompt_cache = {}
+    encoded_by_text = {}
     pipeline = worldstereo_model["pipeline"]
     cfg = getattr(pipeline, "cfg", None) or getattr(worldstereo_model.get("worldstereo"), "cfg", None)
     negative_prompt = ""
@@ -1280,6 +1275,14 @@ def _build_prompt_cache(worldstereo_model, workspace, render_list, model_type, d
         negative_prompt = getattr(cfg, "negative_prompt", "") or ""
     do_cfg = model_type != "worldstereo-memory-dmd"
     render_root = Path(workspace["scene_dir"]) / "render_results"
+
+    # T5 is deliberately excluded from Accelerate's sequential CPU-offload
+    # hooks by the WorldStereo loader.  Load it once for the whole prompt batch;
+    # moving/freeing pipeline hooks around every caption turns a short text
+    # encoding stage into repeated layer-by-layer CPU/GPU transfers.
+    text_encoder = getattr(pipeline, "text_encoder", None)
+    if text_encoder is not None and hasattr(text_encoder, "to"):
+        text_encoder.to(device)
     for render_path in render_list:
         parts = Path(render_path).parts
         view_id, traj_id = parts[-3], parts[-2]
@@ -1290,13 +1293,36 @@ def _build_prompt_cache(worldstereo_model, workspace, render_list, model_type, d
             )
         with open(caption_path, "r", encoding="utf-8") as handle:
             prompt = json.load(handle).get("prompt", "")
-        prompt_cache[(view_id, traj_id)] = _encode_prompt_cache(
-            pipeline,
-            prompt,
-            negative_prompt,
-            do_classifier_free_guidance=do_cfg,
-            device=device,
-        )
+        # Several trajectories commonly share the same caption (always true for
+        # manual_caption).  Encoding by trajectory made sequential CPU offload
+        # shuttle the entire T5 stack once per trajectory for identical output.
+        cache_key = (str(prompt), str(negative_prompt), bool(do_cfg))
+        if cache_key not in encoded_by_text:
+            encoded_by_text[cache_key] = _encode_prompt_cache(
+                pipeline,
+                prompt,
+                negative_prompt,
+                do_classifier_free_guidance=do_cfg,
+                device=device,
+            )
+        prompt_cache[(view_id, traj_id)] = encoded_by_text[cache_key]
+
+    # Video generation receives prompt_embeds directly and does not need T5.
+    # Keep the encoder object registered on the pipeline, but ensure its weights
+    # no longer occupy VRAM after the cache has been built.
+    if text_encoder is not None and hasattr(text_encoder, "to"):
+        with contextlib.suppress(Exception):
+            text_encoder.to("cpu")
+    if hasattr(pipeline, "maybe_free_model_hooks"):
+        with contextlib.suppress(Exception):
+            pipeline.maybe_free_model_hooks()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    _hy_log(
+        "World Expansion",
+        f"Prompt cache encoded {len(encoded_by_text)} unique prompt(s) for {len(prompt_cache)} trajectory(s); text encoder offloaded",
+    )
     return prompt_cache
 
 
@@ -1562,7 +1588,8 @@ def _trajectory_scene_median_depth(scene):
 def _anchor_camera_candidates(scene):
     render_root = Path(scene) / "render_results"
     paths = []
-    for pattern in ("wonder*/traj*/camera.json", "reconstruct*/traj*/camera.json"):
+    for pattern in ("view*/traj*/camera.json", "target*/traj*/camera.json",
+                    "wonder*/traj*/camera.json", "reconstruct*/traj*/camera.json"):
         paths.extend(render_root.glob(pattern))
     result = []
     for path in sorted(paths):
@@ -1591,7 +1618,10 @@ def _make_anchor_scan_c2ws(anchor_c2w, nframe, yaw_degrees):
     base_forward = base_forward / np.linalg.norm(base_forward)
     up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
     frames = max(2, int(nframe))
-    angles = np.linspace(0.0, np.deg2rad(float(yaw_degrees)), frames, endpoint=False)
+    # A full scan includes the closing pose. With the native 21-frame format this
+    # gives an 18-degree interval and exact cardinal poses at frames 0/5/10/15.
+    full_circle = np.isclose(abs(float(yaw_degrees)), 360.0, atol=1e-6)
+    angles = np.linspace(0.0, np.deg2rad(float(yaw_degrees)), frames, endpoint=full_circle)
     c2ws = []
     for angle in angles:
         c, s = np.cos(angle), np.sin(angle)
@@ -1615,53 +1645,113 @@ def _make_anchor_scan_c2ws(anchor_c2w, nframe, yaw_degrees):
     return np.asarray(c2ws, dtype=np.float64)
 
 
+def _safe_anchor_positions(scene, topk, min_distance, min_separation):
+    """Choose scan anchors inside robust scene bounds and away from surfaces."""
+    from scipy.spatial import cKDTree
+
+    pcd_path = Path(scene) / "render_results" / "global_pcd.ply"
+    if not pcd_path.exists():
+        return []
+    import trimesh
+
+    cloud = trimesh.load(pcd_path, process=False)
+    points = np.asarray(cloud.vertices, dtype=np.float64)
+    points = points[np.isfinite(points).all(axis=1)]
+    if len(points) < 32:
+        return []
+    # Ignore isolated depth outliers; they otherwise make the nominal scene box enormous.
+    low, high = np.quantile(points, [0.01, 0.99], axis=0)
+    extent = high - low
+    if np.any(extent[:2] <= 1e-6):
+        return []
+    center = (low + high) * 0.5
+    scale = max(float(np.median(extent[:2])), 1e-6)
+    margin_xy = np.maximum(extent[:2] * 0.08, scale * 0.03)
+    inner_low, inner_high = low[:2] + margin_xy, high[:2] - margin_xy
+    if np.any(inner_high <= inner_low):
+        return []
+
+    candidates = _anchor_camera_candidates(scene)
+    existing_z = [item["position"][2] for item in candidates if np.isfinite(item["position"][2])]
+    camera_z = float(np.median(existing_z)) if existing_z else float(center[2])
+    camera_z = float(np.clip(camera_z, low[2] + extent[2] * 0.05, high[2] - extent[2] * 0.05))
+
+    # Existing valid poses are useful priors; a regular grid makes the method independent
+    # of bad wonder/reconstruct endpoints and lets it discover large free regions.
+    xy = [item["position"][:2] for item in candidates]
+    grid_side = int(np.clip(np.ceil(np.sqrt(max(25, int(topk) * 16))), 5, 15))
+    xs = np.linspace(inner_low[0], inner_high[0], grid_side)
+    ys = np.linspace(inner_low[1], inner_high[1], grid_side)
+    xy.extend(np.array(np.meshgrid(xs, ys)).reshape(2, -1).T)
+    xy.append(center[:2])
+    positions = np.asarray([[p[0], p[1], camera_z] for p in xy], dtype=np.float64)
+    inside = np.all((positions[:, :2] >= inner_low) & (positions[:, :2] <= inner_high), axis=1)
+    positions = positions[inside]
+
+    # Subsample only for the distance index; quantile bounds above still use all points.
+    index_points = points[::max(1, len(points) // 500000)]
+    tree = cKDTree(index_points)
+    clearance = tree.query(positions, k=1, workers=-1)[0]
+    min_clearance = max(float(min_distance) * _trajectory_scene_median_depth(scene), scale * 0.015)
+    valid = clearance >= min_clearance
+    positions, clearance = positions[valid], clearance[valid]
+    if not len(positions):
+        return []
+
+    # Prefer open, central locations. The centrality term avoids boundary-hugging anchors
+    # even when a side of an outdoor point cloud is sparse.
+    centrality = np.linalg.norm((positions[:, :2] - center[:2]) / np.maximum(extent[:2], 1e-6), axis=1)
+    score = clearance - scale * 0.2 * centrality
+    order = np.argsort(score)[::-1]
+    separation = max(float(min_separation) * _trajectory_scene_median_depth(scene), scale * 0.08)
+    selected = []
+    for idx in order:
+        position = positions[idx]
+        if any(np.linalg.norm(position[:2] - other[:2]) < separation for other in selected):
+            continue
+        selected.append(position)
+        if len(selected) >= int(topk):
+            break
+    return selected
+
+
 def _write_anchor_scans(scene, topk, min_distance, min_separation, yaw_degrees, nframe):
     import cv2
     from hyworld2.worldgen.src.panorama_utils import split_panorama_image
 
     scene = Path(scene)
-    candidates = _anchor_camera_candidates(scene)
-    if not candidates:
-        print("[HYWorld2 Trajectories] Anchor scan: no wonder/reconstruct camera candidates found")
+    positions = _safe_anchor_positions(scene, topk, min_distance, min_separation)
+    if not positions:
+        print("[HYWorld2 Trajectories] Anchor scan: no geometrically safe in-bounds positions found")
         return []
     median_depth = max(_trajectory_scene_median_depth(scene), 1e-6)
     print(
         "[HYWorld2 Trajectories] Anchor scan: "
-        f"candidates={len(candidates)}, topk={int(topk)}, median_depth={median_depth:.4f}, "
+        f"safe_positions={len(positions)}, topk={int(topk)}, median_depth={median_depth:.4f}, "
         f"min_distance={float(min_distance)}x, min_separation={float(min_separation)}x"
     )
-    min_distance_abs = float(min_distance) * median_depth
-    min_separation_abs = float(min_separation) * median_depth
-    candidates.sort(key=lambda item: float(np.linalg.norm(item["position"][:2])), reverse=True)
-    selected = []
-    for candidate in candidates:
-        pos = candidate["position"]
-        if np.linalg.norm(pos[:2]) < min_distance_abs:
-            continue
-        if any(np.linalg.norm(pos[:2] - other["position"][:2]) < min_separation_abs for other in selected):
-            continue
-        selected.append(candidate)
-        if len(selected) >= int(topk):
-            break
-    if not selected:
-        print("[HYWorld2 Trajectories] Anchor scan: no candidates passed distance/separation filters")
-        return []
-
     full_img = _load_workspace_panorama(scene)
+    source_candidates = _anchor_camera_candidates(scene)
+    template = source_candidates[0] if source_candidates else None
+    if template is None:
+        print("[HYWorld2 Trajectories] Anchor scan: camera intrinsics unavailable")
+        return []
     written = []
-    for index, candidate in enumerate(selected):
-        data = candidate["data"]
+    for index, position in enumerate(positions):
+        data = template["data"]
         image_w = int(data["width"])
         image_h = int(data["height"])
         K = np.asarray(data["intrinsic"][0], dtype=np.float64)
-        c2ws = _make_anchor_scan_c2ws(candidate["c2w"], nframe, yaw_degrees)
+        anchor_c2w = template["c2w"].copy()
+        anchor_c2w[:3, 3] = position
+        c2ws = _make_anchor_scan_c2ws(anchor_c2w, nframe, yaw_degrees)
         w2cs = np.linalg.inv(c2ws)
         dets = np.linalg.det(w2cs[:, :3, :3])
         up_z = c2ws[:, 2, 1]
         if np.any(dets < 0.9) or np.any(dets > 1.1) or np.any(up_z > -0.5):
             raise RuntimeError(
                 "HYWorld2 anchor scan generated invalid camera orientation "
-                f"for {candidate['path']}: det_range=({float(dets.min()):.4f}, {float(dets.max()):.4f}), "
+                f"for position {position.tolist()}: det_range=({float(dets.min()):.4f}, {float(dets.max()):.4f}), "
                 f"up_z_range=({float(up_z.min()):.4f}, {float(up_z.max()):.4f})."
             )
         K_pano = K.copy()
@@ -1675,12 +1765,15 @@ def _write_anchor_scans(scene, topk, min_distance, min_separation, yaw_degrees, 
         camera_info = {
             "id": index,
             "type": "anchor_scan",
-            "source_camera": str(candidate["path"]),
+            "source_camera": str(template["path"]),
             "width": image_w,
             "height": image_h,
+            "fov_x": float(data.get("fov_x", np.rad2deg(2.0 * np.arctan(image_w / (2.0 * K[0, 0]))))),
+            "fov_y": float(data.get("fov_y", np.rad2deg(2.0 * np.arctan(image_h / (2.0 * K[1, 1]))))),
             "intrinsic": [K.tolist()] * len(w2cs),
             "extrinsic": w2cs.tolist(),
-            "anchor_position": candidate["position"].tolist(),
+            "anchor_position": position.tolist(),
+            "anchor_validation": "robust_pcd_bounds_and_surface_clearance",
             "yaw_degrees": float(yaw_degrees),
         }
         with open(traj_dir / "camera.json", "w", encoding="utf-8") as handle:
@@ -1971,6 +2064,17 @@ class HYWorld2QwenVL:
         generated = generated[:, inputs["input_ids"].shape[1]:]
         result = tokenizer.decode(generated[0], skip_special_tokens=True).strip()
         if not keep_model_loaded:
+            # Non-cached bundles are not visible to _clear_cache(). Explicitly
+            # break their references here; otherwise Transformers/Accelerate/
+            # quantization cycles can keep the final caption model resident until
+            # a much later GC, overlapping WorldStereo despite keep=False.
+            with contextlib.suppress(Exception):
+                model.cpu()
+            bundle.clear()
+            del generated, inputs, model, processor, tokenizer, bundle
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             self._clear_cache(keep_signature=None)
         else:
             self._clear_cache(keep_signature=signature)
@@ -2232,6 +2336,11 @@ class HYWorld2Trajectories:
         anchor_scan_min_distance=1.0,
         anchor_scan_min_separation=0.75,
         anchor_scan_yaw_degrees=360.0,
+        points_per_pixel=20,
+        global_pcd_voxel_size=0.0,
+        no_llm_mode=False,
+        image_width=0,
+        image_height=0,
     ):
         qwen_device = "auto"
         qwen_cpu_offload = False
@@ -2290,6 +2399,11 @@ class HYWorld2Trajectories:
             anchor_scan_min_distance=float(anchor_scan_min_distance),
             anchor_scan_min_separation=float(anchor_scan_min_separation),
             anchor_scan_yaw_degrees=float(anchor_scan_yaw_degrees),
+            points_per_pixel=int(points_per_pixel),
+            global_pcd_voxel_size=float(global_pcd_voxel_size),
+            no_llm_mode=bool(no_llm_mode),
+            image_width=int(image_width),
+            image_height=int(image_height),
         )
         cache_ok, cache_reason, cache_state = _hyworld2_trajectory_cache_status(
             scene,
@@ -2322,6 +2436,11 @@ class HYWorld2Trajectories:
         skip_exist = True
         render_root_existed = render_root.exists()
         print(f"[HYWorld2 Trajectories] Auto cache miss: {cache_reason}")
+        if cache_reason == "trajectory settings changed":
+            # Camera geometry settings (resolution/FOV included) must rebuild every
+            # camera.json and start frame; reusing them would mismatch K and pixels.
+            skip_exist = False
+            logs.append({"stage": "auto_cache", "action": "camera_regeneration", "reason": cache_reason})
         if cache_reason == "panorama cache mismatch" and render_root_existed and workspace.get("cache_action") != "panorama_unchanged":
             print("[HYWorld2 Trajectories] Source panorama changed; clearing stale render_results for full regeneration.")
             shutil.rmtree(render_root)
@@ -2342,29 +2461,36 @@ class HYWorld2Trajectories:
         print(f"[HYWorld2 Trajectories] Workspace: {scene}")
         print(f"[HYWorld2 Trajectories] SAM3 repo/path: {sam3_path or HYWORLD2_SAM3_REPO_ID}")
 
-        print("[HYWorld2 Trajectories] Releasing Comfy models before local QwenVL planner")
-        _release_model_memory("HYWorld2 Trajectories")
-        print("[HYWorld2 Trajectories] Stage 1/5: preparing local QwenVL planner context")
-        planner_written = _ensure_trajectory_planner_context(
-            workspace,
-            scene_type=scene_type,
-            apply_nav_traj=bool(apply_nav_traj),
-            apply_detail_traj=bool(apply_detail_traj),
-            detail_object_limit=int(detail_object_limit),
-            force_vlm=bool(force_vlm),
-            qwen_model_id=qwen_model_id,
-            qwen_quantization=qwen_quantization,
-            qwen_attention_mode=qwen_attention_mode,
-            qwen_device=qwen_device,
-            qwen_max_new_tokens=int(qwen_max_new_tokens),
-            qwen_max_image_edge=int(qwen_max_image_edge),
-            qwen_keep_model_loaded=bool(qwen_keep_model_loaded),
-            qwen_cpu_offload=bool(qwen_cpu_offload),
-        )
-        HYWorld2QwenVL._clear_cache()
-        print("[HYWorld2 Trajectories] Stage 1/5 complete: planner context ready")
-        print("[HYWorld2 Trajectories] Releasing Comfy/Qwen models before geometry generation")
-        _release_model_memory("HYWorld2 Trajectories")
+        planner_written = {}
+        if bool(no_llm_mode):
+            resolved_scene_type = str(scene_type).lower()
+            if resolved_scene_type not in ("indoor", "outdoor"):
+                resolved_scene_type = str(workspace.get("scene_type", "indoor")).lower()
+            if resolved_scene_type not in ("indoor", "outdoor"):
+                resolved_scene_type = "indoor"
+            meta_path = scene / "meta_info.json"
+            meta = _hyworld2_read_json_file(meta_path, default={}) or {}
+            meta["scene_type"] = resolved_scene_type
+            _hyworld2_write_json_file(meta_path, meta)
+            workspace["scene_type"] = resolved_scene_type
+            print(f"[HYWorld2 Trajectories Test] LLM-free mode; scene_type={resolved_scene_type}")
+        else:
+            print("[HYWorld2 Trajectories] Releasing Comfy models before local QwenVL planner")
+            _release_model_memory("HYWorld2 Trajectories")
+            print("[HYWorld2 Trajectories] Stage 1/5: preparing local QwenVL planner context")
+            planner_written = _ensure_trajectory_planner_context(
+                workspace, scene_type=scene_type, apply_nav_traj=bool(apply_nav_traj),
+                apply_detail_traj=bool(apply_detail_traj), detail_object_limit=int(detail_object_limit),
+                force_vlm=bool(force_vlm), qwen_model_id=qwen_model_id,
+                qwen_quantization=qwen_quantization, qwen_attention_mode=qwen_attention_mode,
+                qwen_device=qwen_device, qwen_max_new_tokens=int(qwen_max_new_tokens),
+                qwen_max_image_edge=int(qwen_max_image_edge),
+                qwen_keep_model_loaded=bool(qwen_keep_model_loaded), qwen_cpu_offload=bool(qwen_cpu_offload),
+            )
+            HYWorld2QwenVL._clear_cache()
+            print("[HYWorld2 Trajectories] Stage 1/5 complete: planner context ready")
+            print("[HYWorld2 Trajectories] Releasing Comfy/Qwen models before geometry generation")
+            _release_model_memory("HYWorld2 Trajectories")
 
         print("[HYWorld2 Trajectories] Stage 2/5: generating official camera trajectories")
         from hyworld2.worldgen import traj_generate, traj_render
@@ -2376,6 +2502,8 @@ class HYWorld2Trajectories:
             seed=int(seed),
             split_view_num=int(split_view_num),
             splitted_resolution=int(splitted_resolution),
+            image_width=max(0, int(image_width)),
+            image_height=max(0, int(image_height)),
             nframe=int(nframe),
             distance_threshold=float(distance_threshold),
             obs_iteration_limit=int(obs_iteration_limit),
@@ -2434,26 +2562,19 @@ class HYWorld2Trajectories:
         if int(render_processes) not in (0, 1):
             print("[HYWorld2 Trajectories] render_processes is ignored in native mode; using one in-process renderer.")
         print("[HYWorld2 Trajectories] Stage 4/5: rendering trajectories natively with 1 process")
-        render_config = Namespace(
-            target_path=str(scene),
-            seed=int(seed),
-            node_rank=0,
-            node_size=1,
-            llm_addr="localhost",
-            llm_port=8000,
-            llm_name=HYWORLD2_QWENVL_MODELS.get(qwen_model_id, {}).get("repo_id", qwen_model_id),
-            caption_workers=1,
-            caption_sample_count=4,
-            caption_max_tokens=256,
-            disable_vlm_caption=True,
-        )
+        render_config = Namespace(target_path=str(scene), seed=int(seed), node_rank=0, node_size=1,
+                                  disable_vlm_caption=True, points_per_pixel=int(points_per_pixel),
+                                  global_pcd_voxel_size=float(global_pcd_voxel_size))
         traj_render.run_traj_render(render_config, rank=0, world_size=1, local_rank=0)
         logs.append({"stage": "traj_render", "mode": "native_api", "world_size": 1})
         print("[HYWorld2 Trajectories] Stage 4/5 complete: render.mp4/render_mask.mp4 generated")
 
-        from hyworld2.worldgen.src.data_utils import sort_trajs
-
-        render_list = sort_trajs(str(render_root))
+        sorted_output = self._sort(
+            workspace, generated=True, captions_written=[],
+            anchor_scans_written=anchor_scans_written, logs=logs,
+        )
+        data = sorted_output[0]
+        render_list = data["render_list"]
         print(f"[HYWorld2 Trajectories] Stage 5/5: sorted {len(render_list)} trajectory render(s); captions deferred to World Expansion")
         _hyworld2_write_json_file(
             _hyworld2_trajectory_state_path(scene),
@@ -2466,17 +2587,100 @@ class HYWorld2Trajectories:
                 "anchor_scans_written": len(anchor_scans_written),
             },
         )
-        data = {
-            "workspace": workspace,
-            "render_list": render_list,
-            "count": len(render_list),
-            "generated": True,
-            "planner_context_written": planner_written,
-            "captions_written": [],
-            "anchor_scans_written": anchor_scans_written,
-            "logs": logs,
-        }
+        data["planner_context_written"] = planner_written
         return (data, _safe_json_dumps(data))
+
+
+class HYWorld2TrajectoriesTest(HYWorld2Trajectories):
+    """Experimental trajectory node with no captioning or LLM dependency."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {"workspace": ("HYWORLD2_WORKSPACE",)},
+            "optional": {
+                "seed": ("INT", {"default": 1, "min": 0, "max": 2**31 - 1, "control_after_generate": "fixed"}),
+                "scene_type": (["indoor", "outdoor"], {"default": "indoor"}),
+                "image_width": ("INT", {"default": 640, "min": 64, "max": 4096, "step": 8,
+                                           "tooltip": "Saved trajectory frame width; camera intrinsics are scaled to this width."}),
+                "image_height": ("INT", {"default": 480, "min": 64, "max": 4096, "step": 8,
+                                            "tooltip": "Saved trajectory frame height; camera intrinsics are scaled to this height."}),
+                "fov_x": ("FLOAT", {"default": 90.0, "min": 10.0, "max": 170.0, "step": 1.0,
+                                        "tooltip": "Horizontal field of view in degrees. Vertical FOV is derived from the final aspect ratio."}),
+                "points_per_pixel": ("INT", {"default": 10, "min": 1, "max": 64, "step": 1,
+                                                   "tooltip": "Point layers per pixel. 8-12 is faster and uses less VRAM; 20 matches the original."}),
+                "global_pcd_voxel_size": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10.0, "step": 0.001,
+                                                        "tooltip": "Render-only voxel downsample size in scene units; 0 disables it."}),
+                "apply_anchor_scan": ("BOOLEAN", {"default": True}),
+                "anchor_scan_topk": ("INT", {"default": 2, "min": 0, "max": 32}),
+                "anchor_scan_min_clearance": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 10.0, "step": 0.05,
+                                                        "tooltip": "Minimum distance from camera to scene surfaces, as a multiple of median depth."}),
+                "anchor_scan_min_separation": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 10.0, "step": 0.05}),
+                "anchor_scan_yaw_degrees": ("FLOAT", {"default": 360.0, "min": 1.0, "max": 360.0, "step": 1.0}),
+            },
+        }
+
+    def _sort(self, workspace, generated=False, captions_written=None, anchor_scans_written=None, logs=None):
+        """Keep every rendered regular trajectory as well as optional anchor scans."""
+        result = super()._sort(
+            workspace, generated=generated, captions_written=captions_written,
+            anchor_scans_written=anchor_scans_written, logs=logs,
+        )
+        data = result[0]
+        render_root = Path(workspace["scene_dir"]) / "render_results"
+
+        def order(path):
+            path = Path(path)
+            view_id, traj_id = path.parts[-3], path.parts[-2]
+            if view_id.startswith("view"):
+                return (0, view_id, int(traj_id[4:]) if traj_id.startswith("traj") and traj_id[4:].isdigit() else 999)
+            if view_id.startswith("target"):
+                return (1, view_id, traj_id)
+            if view_id.startswith("reconstruct") and traj_id != "traj1":
+                return (2, view_id, traj_id)
+            if view_id.startswith("wonder"):
+                return (3, view_id, traj_id)
+            if view_id.startswith("reconstruct"):
+                return (4, view_id, traj_id)
+            return (9, view_id, traj_id)
+
+        all_renders = [str(path) for path in sorted(render_root.glob("**/render.mp4"), key=order)]
+        data["render_list"] = all_renders
+        data["count"] = len(all_renders)
+        data["regular_render_count"] = sum(
+            1 for path in all_renders if Path(path).parts[-3].startswith("view")
+        )
+        data["anchor_render_count"] = sum(
+            1 for path in all_renders if Path(path).parts[-3].startswith("wonder_scan_")
+        )
+        print(
+            "[HYWorld2 Trajectories Test] Output trajectories: "
+            f"regular={data['regular_render_count']}, anchors={data['anchor_render_count']}, "
+            f"total={data['count']}"
+        )
+        return (data, _safe_json_dumps(data))
+
+    def run(self, workspace, seed=1, scene_type="indoor", image_width=640, image_height=480,
+            fov_x=90.0, points_per_pixel=10,
+            global_pcd_voxel_size=0.0, apply_anchor_scan=True, anchor_scan_topk=2,
+            anchor_scan_min_clearance=0.15, anchor_scan_min_separation=0.75,
+            anchor_scan_yaw_degrees=360.0, **kwargs):
+        from hyworld2.worldgen.src.general_utils import adjust_image_size
+        final_h, final_w = adjust_image_size(int(image_height), int(image_width))
+        # Preserve square pixels: fy == fx in pixel units. This makes vertical FOV
+        # follow the chosen resolution instead of retaining the old 90-degree constant.
+        fov_y = np.rad2deg(2.0 * np.arctan(np.tan(np.deg2rad(float(fov_x)) * 0.5) * final_h / final_w))
+        return super().run(
+            workspace, seed=seed, scene_type=scene_type, additional_nav_traj=False,
+            extreme_detail_traj=False, apply_nav_traj=False, force_vlm=False, nframe=21,
+            image_width=image_width, image_height=image_height, fov_x=fov_x, fov_y=fov_y,
+            apply_anchor_scan=apply_anchor_scan, anchor_scan_topk=anchor_scan_topk,
+            anchor_scan_min_distance=anchor_scan_min_clearance,
+            anchor_scan_min_separation=anchor_scan_min_separation,
+            anchor_scan_yaw_degrees=anchor_scan_yaw_degrees,
+            points_per_pixel=points_per_pixel, global_pcd_voxel_size=global_pcd_voxel_size,
+            no_llm_mode=True,
+        )
 
 
 class HYWorld2MemoryBank:
@@ -2641,6 +2845,11 @@ class HYWorld2WorldExpansion:
                 "qwen_frame_count": ("INT", {"default": 4, "min": 1, "max": 16}),
                 "seed": ("INT", {"default": 1, "min": 0, "max": 2**31 - 1, "control_after_generate": "fixed"}),
                 "max_trajectories": ("INT", {"default": 0, "min": 0, "max": 100000}),
+                "manual_caption": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": "If non-empty, use this prompt for every trajectory and skip Qwen/VL caption analysis entirely.",
+                }),
             },
         }
 
@@ -2742,6 +2951,7 @@ class HYWorld2WorldExpansion:
         qwen_frame_count=4,
         seed=1,
         max_trajectories=0,
+        manual_caption="",
     ):
         qwen_device = "auto"
         qwen_cpu_offload = False
@@ -2762,6 +2972,11 @@ class HYWorld2WorldExpansion:
             render_list = render_list[: int(max_trajectories)]
         state_path = _hyworld2_world_expansion_state_path(workspace["scene_dir"])
         expansion_state = _hyworld2_read_json_file(state_path, default={}) or {}
+        manual_caption = str(manual_caption or "").strip()
+        caption_source = "manual" if manual_caption else "qwenvl"
+        caption_signature = hashlib.sha256(
+            (f"{caption_source}:" + manual_caption).encode("utf-8", errors="ignore")
+        ).hexdigest()
         legacy_seed = 1
         state_seed = expansion_state.get("seed", legacy_seed)
         seed_matches = int(state_seed) == int(seed)
@@ -2772,6 +2987,18 @@ class HYWorld2WorldExpansion:
             _hy_log("World Expansion", f"Expansion cache seed matches: seed={int(seed)}")
         else:
             _hy_log("World Expansion", f"Expansion cache seed changed: cached={state_seed}, requested={int(seed)}; result videos will be regenerated")
+        cached_caption_signature = expansion_state.get("caption_signature")
+        if manual_caption:
+            caption_matches = cached_caption_signature == caption_signature
+        else:
+            # Preserve compatibility with old auto-caption states which predate
+            # caption_signature; a manual prompt must always match explicitly.
+            caption_matches = cached_caption_signature in (None, caption_signature)
+        if not caption_matches:
+            _hy_log(
+                "World Expansion",
+                f"Caption source/text changed ({caption_source}); result videos will be regenerated",
+            )
         render_items = []
         pending_render_list = []
         existing_result_count = 0
@@ -2781,7 +3008,7 @@ class HYWorld2WorldExpansion:
             traj_dir = Path(workspace["scene_dir"]) / "render_results" / view_id / traj_id
             result_path = traj_dir / f"{model_type}_result.mp4"
             has_result = result_path.is_file() and result_path.stat().st_size > 0
-            can_reuse_result = bool(has_result and seed_matches)
+            can_reuse_result = bool(has_result and seed_matches and caption_matches)
             render_items.append(
                 {
                     "render_path": render_path,
@@ -2806,23 +3033,45 @@ class HYWorld2WorldExpansion:
         _hy_log("World Expansion", "Stage 3/6: ensuring trajectory captions")
         captions_written = []
         if pending_render_list:
-            captions_written = self._ensure_captions(
-                workspace,
-                pending_render_list,
-                caption_mode,
-                qwen_model_id,
-                qwen_device,
-                int(qwen_max_new_tokens),
-                qwen_quantization,
-                qwen_attention_mode,
-                bool(qwen_keep_model_loaded),
-                bool(qwen_cpu_offload),
-                int(qwen_max_image_edge),
-                int(qwen_frame_count),
-            )
+            if manual_caption:
+                _hy_log(
+                    "World Expansion",
+                    f"Manual caption provided; skipping Qwen/VL analysis for {len(pending_render_list)} trajectory(s)",
+                )
+                for render_path in pending_render_list:
+                    caption_path = Path(render_path).parent / "traj_caption.json"
+                    with open(caption_path, "w", encoding="utf-8") as handle:
+                        json.dump(
+                            {"prompt": manual_caption, "source": "HYWorld2 World Expansion manual caption"},
+                            handle,
+                            indent=2,
+                            ensure_ascii=False,
+                        )
+                    captions_written.append(str(caption_path))
+            else:
+                captions_written = self._ensure_captions(
+                    workspace,
+                    pending_render_list,
+                    caption_mode,
+                    qwen_model_id,
+                    qwen_device,
+                    int(qwen_max_new_tokens),
+                    qwen_quantization,
+                    qwen_attention_mode,
+                    bool(qwen_keep_model_loaded),
+                    bool(qwen_cpu_offload),
+                    int(qwen_max_image_edge),
+                    int(qwen_frame_count),
+                )
         else:
             _hy_log("World Expansion", "Stage 3/6: all result videos exist; caption generation skipped")
         _hy_log("World Expansion", f"Stage 3/6 complete: captions_written={len(captions_written)}")
+        # keep_model_loaded is useful while captioning many trajectories, but the
+        # VLM must never overlap the much larger WorldStereo generation stage.
+        # On a 16 GiB card that overlap leaves zero free VRAM and Accelerate OOMs
+        # while moving even a small offloaded WorldStereo block to CUDA.
+        _hy_log("World Expansion", "Releasing Qwen/VL before WorldStereo prompt encoding and generation")
+        HYWorld2QwenVL._clear_cache()
         _hy_log("World Expansion", "Stage 4/6: encoding prompt cache")
         prompt_cache = _build_prompt_cache(model, workspace, pending_render_list, model_type, device) if pending_render_list else {}
         _hy_log("World Expansion", f"Stage 4/6 complete: cached {len(prompt_cache)} prompt embedding set(s)")
@@ -2908,6 +3157,8 @@ class HYWorld2WorldExpansion:
                 "render_count": len(render_list),
                 "completed_count": len(completed),
                 "result_paths": completed,
+                "caption_source": caption_source,
+                "caption_signature": caption_signature,
             },
         )
         _hy_log("World Expansion", f"World expansion complete: completed={len(completed)}")
@@ -2918,6 +3169,7 @@ class HYWorld2WorldExpansion:
                     "completed": completed,
                     "count": len(completed),
                     "captions_written": captions_written,
+                    "caption_source": caption_source,
                     "seed": int(seed),
                     "seed_cache_action": "reuse_existing" if not pending_render_list else "generated_pending",
                     "state_path": str(state_path),
@@ -3157,6 +3409,7 @@ class HYWorld2KleinWorldExpansion:
             "resolution_steps": int(resolution_steps),
             "frames_per_trajectory": int(frames_per_trajectory),
             "use_context_image": bool(use_context_image),
+            "keyframe_selection": "anchor_scan_circular_v2",
         }
         settings_match = expansion_state.get("settings_signature") == settings_signature
         sampler = _run_comfy_node("KSamplerSelect", "execute", str(sampler_name))
@@ -3217,8 +3470,26 @@ class HYWorld2KleinWorldExpansion:
                 continue
 
             render_frames = _load_video_frames(item["render_path"])
-            canonical_keyframe_indices = _worldstereo_keyframe_indices(len(render_frames)).detach().cpu().numpy().astype(np.int64).tolist()
-            keyframe_indices = _select_evenly_spaced_indices(canonical_keyframe_indices, int(frames_per_trajectory))
+            if str(camera_data.get("type", "")).lower() == "anchor_scan":
+                # Anchor scans are deliberately sparse directional samples (for
+                # example 0/90/180/270). WorldStereo's every-fourth-frame rule
+                # would collapse a four-frame scan to a single image.
+                canonical_keyframe_indices = list(range(len(render_frames)))
+            else:
+                canonical_keyframe_indices = _worldstereo_keyframe_indices(len(render_frames)).detach().cpu().numpy().astype(np.int64).tolist()
+            if (str(camera_data.get("type", "")).lower() == "anchor_scan"
+                    and np.isclose(abs(float(camera_data.get("yaw_degrees", 0.0))), 360.0, atol=1e-6)
+                    and 0 < int(frames_per_trajectory) < len(canonical_keyframe_indices)):
+                # The final frame closes the circle and duplicates 0 degrees. Sample
+                # the unique interval [0, N-1), yielding 0/5/10/15 for N=21,count=4.
+                unique_count = max(1, len(canonical_keyframe_indices) - 1)
+                picks = np.rint(
+                    np.arange(int(frames_per_trajectory), dtype=np.float64)
+                    * unique_count / int(frames_per_trajectory)
+                ).astype(np.int64)
+                keyframe_indices = [canonical_keyframe_indices[int(index)] for index in picks]
+            else:
+                keyframe_indices = _select_evenly_spaced_indices(canonical_keyframe_indices, int(frames_per_trajectory))
             if not keyframe_indices:
                 raise RuntimeError(f"No keyframes selected for trajectory: {item['render_path']}")
             _hy_log(
@@ -3311,6 +3582,163 @@ class HYWorld2KleinWorldExpansion:
                 }
             ),
         )
+
+
+def _dataset_fit_image(image, size, mode="contain", fill=(0, 0, 0)):
+    """Resize an RGB image to an exact dataset size without accidental distortion."""
+    image = image.convert("RGB")
+    target_w, target_h = int(size[0]), int(size[1])
+    if image.size == (target_w, target_h):
+        return image
+    if mode == "stretch":
+        return image.resize((target_w, target_h), Image.Resampling.LANCZOS)
+    source_w, source_h = image.size
+    scale = (max if mode == "cover" else min)(target_w / source_w, target_h / source_h)
+    resized_w = max(1, int(round(source_w * scale)))
+    resized_h = max(1, int(round(source_h * scale)))
+    resized = image.resize((resized_w, resized_h), Image.Resampling.LANCZOS)
+    if mode == "cover":
+        left = max(0, (resized_w - target_w) // 2)
+        top = max(0, (resized_h - target_h) // 2)
+        return resized.crop((left, top, left + target_w, top + target_h))
+    canvas = Image.new("RGB", (target_w, target_h), fill)
+    canvas.paste(resized, ((target_w - resized_w) // 2, (target_h - resized_h) // 2))
+    return canvas
+
+
+class HYWorld2SaveExpansionDataset:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "workspace": ("HYWORLD2_WORKSPACE",),
+                "trajectory_set": ("HYWORLD2_TRAJECTORY_SET",),
+            },
+            "optional": {
+                "expansion_dependency": ("HYWORLD2_MEMORY_BANK",),
+                "output_directory": ("STRING", {"default": "hyworld2_klein_dataset"}),
+                "world_expansion_result_name": ("STRING", {"default": "worldstereo-memory-dmd"}),
+                "frame_stride": ("INT", {"default": 1, "min": 1, "max": 10000}),
+                "max_frames_per_trajectory": ("INT", {"default": 0, "min": 0, "max": 100000}),
+                "panorama_fit": (["contain", "cover", "stretch"], {"default": "contain"}),
+                "overwrite_existing": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("dataset_directory", "info")
+    FUNCTION = "run"
+    CATEGORY = "VNCCS/HYWorld2"
+    OUTPUT_NODE = True
+
+    def run(
+        self,
+        workspace,
+        trajectory_set,
+        expansion_dependency=None,
+        output_directory="hyworld2_klein_dataset",
+        world_expansion_result_name="worldstereo-memory-dmd",
+        frame_stride=1,
+        max_frames_per_trajectory=0,
+        panorama_fit="contain",
+        overwrite_existing=False,
+    ):
+        del expansion_dependency  # Optional execution-order link from World Expansion.
+        scene = Path(workspace["scene_dir"])
+        output = Path(str(output_directory or "hyworld2_klein_dataset")).expanduser()
+        if not output.is_absolute():
+            output = _output_root() / output
+        output = output.resolve()
+        folders = {name: output / name for name in ("img", "control1", "control2", "control3")}
+        for folder in folders.values():
+            _ensure_dir(folder)
+
+        panorama_path = scene / "panorama_sr.png"
+        if not panorama_path.exists():
+            panorama_path = scene / "panorama.png"
+        if not panorama_path.exists():
+            raise FileNotFoundError(f"Dataset export requires panorama.png or panorama_sr.png: {scene}")
+        panorama = Image.open(panorama_path).convert("RGB")
+
+        result_name = str(world_expansion_result_name or "worldstereo-memory-dmd").strip()
+        render_list = list(trajectory_set.get("render_list", []))
+        records = []
+        skipped_trajectories = []
+        written = 0
+        stride = max(1, int(frame_stride))
+        max_frames = max(0, int(max_frames_per_trajectory))
+
+        for render_value in render_list:
+            render_path = Path(render_value)
+            if len(render_path.parts) < 3:
+                continue
+            view_id, traj_id = render_path.parts[-3], render_path.parts[-2]
+            traj_dir = scene / "render_results" / view_id / traj_id
+            result_path = traj_dir / f"{result_name}_result.mp4"
+            if not result_path.exists():
+                skipped_trajectories.append({"trajectory": f"{view_id}/{traj_id}", "reason": f"missing {result_path.name}"})
+                continue
+            target_frames = _load_video_frames(result_path)
+            hole_frames = _load_video_frames(render_path)
+            if not target_frames or not hole_frames:
+                skipped_trajectories.append({"trajectory": f"{view_id}/{traj_id}", "reason": "empty target or render video"})
+                continue
+
+            target_indices = list(range(0, len(target_frames), stride))
+            if max_frames > 0:
+                target_indices = target_indices[:max_frames]
+            for sequence_index, target_index in enumerate(target_indices):
+                # Align videos by normalized time, which remains correct if codecs or
+                # generation stages emitted different frame counts.
+                if len(target_frames) <= 1 or len(hole_frames) <= 1:
+                    hole_index = 0
+                else:
+                    hole_index = int(round(target_index * (len(hole_frames) - 1) / (len(target_frames) - 1)))
+                target = target_frames[target_index].convert("RGB")
+                size = target.size
+                control1 = _dataset_fit_image(panorama, size, mode=str(panorama_fit))
+                control2 = _dataset_fit_image(hole_frames[hole_index], size, mode="stretch")
+                control3 = (
+                    Image.new("RGB", size, (0, 0, 0))
+                    if sequence_index == 0
+                    else _dataset_fit_image(target_frames[max(0, target_index - 1)], size, mode="stretch")
+                )
+
+                safe_view = re.sub(r"[^A-Za-z0-9_.-]+", "_", view_id)
+                safe_traj = re.sub(r"[^A-Za-z0-9_.-]+", "_", traj_id)
+                filename = f"{safe_view}__{safe_traj}__{sequence_index:06d}.png"
+                paths = {name: folder / filename for name, folder in folders.items()}
+                if not bool(overwrite_existing) and any(path.exists() for path in paths.values()):
+                    raise FileExistsError(
+                        f"Dataset sample already exists: {filename}. Enable overwrite_existing or choose another output_directory."
+                    )
+                target.save(paths["img"], format="PNG")
+                control1.save(paths["control1"], format="PNG")
+                control2.save(paths["control2"], format="PNG")
+                control3.save(paths["control3"], format="PNG")
+                records.append({
+                    "file": filename, "view_id": view_id, "traj_id": traj_id,
+                    "sequence_index": sequence_index, "target_frame": target_index,
+                    "control2_frame": hole_index, "width": size[0], "height": size[1],
+                    "target_video": str(result_path), "control2_video": str(render_path),
+                    "panorama": str(panorama_path),
+                })
+                written += 1
+
+        manifest_path = output / "metadata.jsonl"
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        info = {
+            "dataset_directory": str(output), "samples": written,
+            "trajectories_requested": len(render_list), "skipped_trajectories": skipped_trajectories,
+            "folders": {key: str(value) for key, value in folders.items()},
+            "manifest": str(manifest_path), "panorama_fit": str(panorama_fit),
+        }
+        _hy_log("Dataset Export", f"Saved {written} aligned samples to {output}")
+        if written == 0:
+            raise RuntimeError(f"Dataset export produced no samples: {_safe_json_dumps(info)}")
+        return (str(output), _safe_json_dumps(info))
 
 
 class HYWorld2PrepareWorldMirrorBatch:
@@ -3785,9 +4213,11 @@ NODE_CLASS_MAPPINGS = {
     "HYWorld2Workspace": HYWorld2Workspace,
     "HYWorld2QwenVL": HYWorld2QwenVL,
     "HYWorld2Trajectories": HYWorld2Trajectories,
+    "HYWorld2TrajectoriesTest": HYWorld2TrajectoriesTest,
     "HYWorld2MemoryBank": HYWorld2MemoryBank,
     "HYWorld2WorldExpansion": HYWorld2WorldExpansion,
     "HYWorld2KleinWorldExpansion": HYWorld2KleinWorldExpansion,
+    "HYWorld2SaveExpansionDataset": HYWorld2SaveExpansionDataset,
     "HYWorld2PrepareWorldMirrorBatch": HYWorld2PrepareWorldMirrorBatch,
     "HYWorld2MemoryAlignment": HYWorld2MemoryAlignment,
     "HYWorld2GSData": HYWorld2GSData,
@@ -3798,9 +4228,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "HYWorld2Workspace": "HYWorld2 Workspace",
     "HYWorld2QwenVL": "HYWorld2 QwenVL",
     "HYWorld2Trajectories": "HYWorld2 Trajectories",
+    "HYWorld2TrajectoriesTest": "HYWorld2 Trajectories (LLM-free test)",
     "HYWorld2MemoryBank": "HYWorld2 Memory Bank",
     "HYWorld2WorldExpansion": "HYWorld2 World Expansion",
     "HYWorld2KleinWorldExpansion": "HYWorld2 Klein World Expansion (experimental)",
+    "HYWorld2SaveExpansionDataset": "HYWorld2 Save Expansion Dataset",
     "HYWorld2PrepareWorldMirrorBatch": "HYWorld2 Prepare WorldMirror Batch",
     "HYWorld2MemoryAlignment": "HYWorld2 Memory Alignment",
     "HYWorld2GSData": "HYWorld2 GS Data",

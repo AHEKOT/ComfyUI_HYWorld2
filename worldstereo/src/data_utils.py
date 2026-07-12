@@ -112,8 +112,16 @@ def load_mutli_traj_dataset(cfg, input_path, output_path, view_id, traj_id, devi
         else:
             pil_image = Image.open(f"{input_path}/image.png")
     origin_w, origin_h = pil_image.size
-    height, width = assign_scale(origin_h, origin_w, scale_map=cfg.scale_map)
-    pil_image = pil_image.resize((width, height), Image.Resampling.BICUBIC)
+    # Trajectory generation has already selected the requested output size and
+    # written camera intrinsics for those exact pixels.  Do not run it through
+    # WorldStereo's legacy aspect-ratio scale buckets a second time (for
+    # example, 512x512 used to become 640x640 here).
+    height, width = origin_h, origin_w
+    if height % 16 != 0 or width % 16 != 0:
+        raise ValueError(
+            f"Trajectory resolution must be divisible by 16 for WorldStereo, got {width}x{height}. "
+            "Regenerate trajectories with a supported width and height."
+        )
     meta = {"image": pil_image}
 
     image = transforms.ToTensor()(pil_image) * 2 - 1
@@ -148,8 +156,8 @@ def load_mutli_traj_dataset(cfg, input_path, output_path, view_id, traj_id, devi
     cam_info = json.load(open(f"{input_path}/{view_id}/{traj_id}/camera.json"))
     w2cs = torch.tensor(np.array(cam_info["extrinsic"]), dtype=torch.float32, device=device)
     intrinsic = torch.tensor(np.array(cam_info["intrinsic"]), dtype=torch.float32, device=device)
-    intrinsic[:, 0, :] = intrinsic[:, 0, :] / origin_w * width
-    intrinsic[:, 1, :] = intrinsic[:, 1, :] / origin_h * height
+    # width/height intentionally equal the trajectory resolution, so the
+    # stored intrinsics remain in their original pixel coordinate system.
 
     if w2cs.shape[0] > cfg.nframe:
         indices = np.linspace(0, w2cs.shape[0] - 1, cfg.nframe, dtype=int)

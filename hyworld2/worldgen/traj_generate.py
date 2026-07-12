@@ -201,6 +201,8 @@ def build_arg_parser():
     parser.add_argument("--seed", default=1024, type=int, help="random seed for reproducibility")
     parser.add_argument("--split_view_num", default=3, type=int, help="final split view num")
     parser.add_argument("--splitted_resolution", default=480, type=int, help="splitted resolution")
+    parser.add_argument("--image_width", default=0, type=int, help="output view width; 0 derives it from FOV")
+    parser.add_argument("--image_height", default=0, type=int, help="output view height; 0 uses splitted_resolution")
     parser.add_argument("--nframe", default=21, type=int, help="number of frames for trajectory generation")
     parser.add_argument("--distance_threshold", default=0.1, type=float, help="distance threshold for obstacle avoidance")
     parser.add_argument("--obs_iteration_limit", default=3, type=int, help="obstacle avoidance iteration limit")
@@ -445,9 +447,14 @@ def run_traj_generate(args):
             with timer.track("[IO] Save sky pointcloud"):
                 sky_pcd.export(f"{scene_path}/render_results/sky_pcd.ply")
 
-        # resize the shortest side to splitted_resolution
-        image_h = args.splitted_resolution
-        image_w = int(round(np.tan(np.deg2rad(args.fov_x / 2)) / np.tan(np.deg2rad(args.fov_y / 2)) * image_h))
+        # Explicit dimensions allow non-wide output. Legacy callers keep the old
+        # FOV-derived width by leaving image_width/image_height at zero.
+        requested_h = int(getattr(args, "image_height", 0))
+        requested_w = int(getattr(args, "image_width", 0))
+        image_h = requested_h if requested_h > 0 else args.splitted_resolution
+        image_w = requested_w if requested_w > 0 else int(round(
+            np.tan(np.deg2rad(args.fov_x / 2)) / np.tan(np.deg2rad(args.fov_y / 2)) * image_h
+        ))
         image_h, image_w = adjust_image_size(image_h, image_w)
 
         print(f"Image size: {image_h}x{image_w}")
@@ -488,7 +495,11 @@ def run_traj_generate(args):
                 K = splitted_intrinsics[i].copy()
                 K[0] *= image_w
                 K[1] *= image_h
-                bank_cameras[fname] = {"intrinsic": K.tolist(), "extrinsic": splitted_extrinsics[i].tolist()}
+                bank_cameras[fname] = {
+                    "intrinsic": K.tolist(), "extrinsic": splitted_extrinsics[i].tolist(),
+                    "width": image_w, "height": image_h,
+                    "fov_x": float(args.fov_x), "fov_y": float(args.fov_y),
+                }
 
                 # Prepare data on the main thread before parallel IO.
                 save_tasks.append(('image', splitted_image, f"{scene_path}/render_results/polar_bank/images/{fname}.png"))
@@ -544,7 +555,11 @@ def run_traj_generate(args):
                 K = splitted_intrinsics[i].copy()
                 K[0] *= image_w
                 K[1] *= image_h
-                bank_cameras[fname] = {"intrinsic": K.tolist(), "extrinsic": splitted_extrinsics[i].tolist()}
+                bank_cameras[fname] = {
+                    "intrinsic": K.tolist(), "extrinsic": splitted_extrinsics[i].tolist(),
+                    "width": image_w, "height": image_h,
+                    "fov_x": float(args.fov_x), "fov_y": float(args.fov_y),
+                }
 
                 save_tasks.append(('image', splitted_image, f"{scene_path}/render_results/pano_bank/images/{fname}.png"))
                 save_tasks.append(('depth', depth.cpu().numpy(), f"{scene_path}/render_results/pano_bank/depths/{fname}.png"))
@@ -683,7 +698,7 @@ def run_traj_generate(args):
 
                     for c2w in c2ws_next:
                         add_scene_cam(scene, c2w, CAM_COLORS[trajectory_i % len(CAM_COLORS)], None,
-                                      args.splitted_resolution * 0.5, imsize=[image_w, image_h],
+                                      image_h * 0.5, imsize=[image_w, image_h],
                                       screen_width=median_depth * 0.15)
 
                     w2cs = np.linalg.inv(c2ws_next)
@@ -693,6 +708,8 @@ def run_traj_generate(args):
                         "intrinsic": Ks.tolist(),
                         "width": image_w,
                         "height": image_h,
+                        "fov_x": float(args.fov_x),
+                        "fov_y": float(args.fov_y),
                         "type": move["name"],
                         "rotation_deg": np.sum(np.abs(move['rotation'])) * (args.obs_decay ** obs_iteration)
                     }
@@ -1190,7 +1207,9 @@ def run_traj_generate(args):
                         "width": image_w,
                         "height": image_h,
                         "intrinsic": [K.tolist()] * len(w2cs),
-                        "extrinsic": w2cs.tolist()
+                        "extrinsic": w2cs.tolist(),
+                        "fov_x": float(args.fov_x),
+                        "fov_y": float(args.fov_y),
                     }
 
                     with open(f"{out_dir}/camera.json", "w") as write:
@@ -1283,6 +1302,8 @@ def run_traj_generate(args):
                             "type": task_name,
                             "width": image_w,
                             "height": image_h,
+                            "fov_x": float(args.fov_x),
+                            "fov_y": float(args.fov_y),
                             "intrinsic": [K.tolist()] * len(w2cs_rise),
                             "extrinsic": w2cs_rise.tolist(),
                             "rotation_deg": float(up_rot_deg),
@@ -1335,6 +1356,8 @@ def run_traj_generate(args):
                                 "type": task_name,
                                 "width": image_w,
                                 "height": image_h,
+                                "fov_x": float(args.fov_x),
+                                "fov_y": float(args.fov_y),
                                 "intrinsic": [K.tolist()] * len(w2cs_eloop),
                                 "extrinsic": w2cs_eloop.tolist(),
                                 "eloop_rotation": 0.5 * ((args.obs_decay) ** obs_iteration)

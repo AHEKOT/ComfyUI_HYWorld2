@@ -348,8 +348,10 @@ def color_print(msg, level="info"):
 
 
 def sample_align_nframe(N, n):
+    if N <= 1 or n <= 0:
+        return np.empty((0,), dtype=np.int64)
     if n > (N - 1):
-        raise ValueError
+        raise ValueError(f"Cannot sample {n} alignment frames from a {N}-frame sequence while skipping frame 0")
 
     # 1. Core logic: N-1 positions are available (1 to N-1); N-1 must be included, and intervals decrease over time
     # We need to choose n points. That gives n-1 internal intervals plus one starting offset.
