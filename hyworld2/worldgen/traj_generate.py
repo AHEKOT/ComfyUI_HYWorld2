@@ -1,5 +1,6 @@
 import argparse
 import copy
+import gc
 import json
 import math
 import os
@@ -100,7 +101,10 @@ os.environ["no_proxy"] = "localhost,127.0.0.1,0.0.0.0"
 os.environ["NO_PROXY"] = "localhost,127.0.0.1,0.0.0.0"
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
 
-SAM_BATCH_SIZE = 4
+# Keep SAM3 inference serial.  Its post-processor expands every predicted mask
+# to the panorama resolution, so batching prompts multiplies the peak memory by
+# the number of objects without improving the result quality.
+SAM_BATCH_SIZE = 1
 MAX_MASK_COUNT = 5
 HF_CACHE_DIR = os.path.expanduser("~/.cache/huggingface/hub")
 ZIM_REPO_ID = "naver-iv/zim-anything-vitl"
@@ -156,7 +160,11 @@ def load_sam3_model(model_path, device, local_files_only=False):
     try:
         started = time.perf_counter()
         print(f"[HYWorld2 TrajGenerate] Loading SAM3 model: path={model_path}, device={device}, local_files_only={local_files_only}")
-        model = Sam3Model.from_pretrained(model_path, local_files_only=local_files_only)
+        model = Sam3Model.from_pretrained(
+            model_path,
+            local_files_only=local_files_only,
+            dtype=torch.float16,
+        ).eval()
         print(f"[HYWorld2 TrajGenerate] SAM3 model weights loaded in {time.perf_counter() - started:.1f}s; moving to {device}")
         model = model.to(device)
         print(f"[HYWorld2 TrajGenerate] SAM3 model moved to {device} in {time.perf_counter() - started:.1f}s; loading processor")
@@ -170,6 +178,48 @@ def load_sam3_model(model_path, device, local_files_only=False):
             "SAM3 is a gated Hugging Face model; either login/provide HF_TOKEN "
             "with approved access, or pass --sam3_path pointing to a local SAM3 checkpoint."
         ) from exc
+
+
+def move_model_to_cpu(model):
+    """Offload a model without discarding it (the outer loop may process more scenes)."""
+    if model is not None:
+        model.to("cpu")
+
+
+def move_zim_to_cpu(predictor):
+    """Drop cached image embeddings as well as offloading the ZIM weights."""
+    reset_image = getattr(predictor, "reset_image", None)
+    if callable(reset_image):
+        reset_image()
+    move_model_to_cpu(getattr(predictor, "model", None))
+
+
+def move_output_tensors_to_cpu(outputs):
+    """Move a transformers ModelOutput to CPU before memory-heavy post-processing."""
+    def move(value):
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu()
+        if isinstance(value, tuple):
+            return tuple(move(item) for item in value)
+        if isinstance(value, list):
+            return [move(item) for item in value]
+        if isinstance(value, dict):
+            return {key: move(item) for key, item in value.items()}
+        return value
+
+    for key, value in list(outputs.items()):
+        value_cpu = move(value)
+        outputs[key] = value_cpu
+        # ModelOutput exposes values both as mapping entries and attributes.
+        # Keep both views synchronized for processors that use attribute access.
+        setattr(outputs, key, value_cpu)
+    return outputs
+
+
+def release_cuda_cache():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def save_image(splitted_image, path):
@@ -256,10 +306,13 @@ def run_traj_generate(args):
     set_seed(args.seed)
 
     print("Models Initializing...")
-    zim_predictor = build_zim_model("vit_l", resolve_zim_checkpoint(), device=device)
-    gd_processor, gd_model = build_gd_model(resolve_gd_checkpoint(), device=device)
+    # These models are used at different times.  Construct them on CPU and only
+    # move the one currently running to CUDA so their weights never overlap in
+    # VRAM with SAM3.
+    zim_predictor = build_zim_model("vit_l", resolve_zim_checkpoint(), device="cpu")
+    gd_processor, gd_model = build_gd_model(resolve_gd_checkpoint(), device="cpu")
 
-    depth_model = MoGeModel.from_pretrained(MOGE_ID).to(device).eval()
+    depth_model = MoGeModel.from_pretrained(MOGE_ID).eval()
 
     sam3_model = None
     sam3_processor = None
@@ -363,7 +416,14 @@ def run_traj_generate(args):
         else:
             with timer.track("Get sky mask"):
                 if meta_info["scene_type"] == "outdoor":
-                    sky_mask = torch.tensor(~get_zim_mask(full_img, "sky.", 0.3, 0.3, zim_predictor, gd_processor, gd_model, DEVICE=device))
+                    zim_predictor.model.to(device)
+                    gd_model.to(device)
+                    try:
+                        sky_mask = torch.tensor(~get_zim_mask(full_img, "sky.", 0.3, 0.3, zim_predictor, gd_processor, gd_model, DEVICE=device))
+                    finally:
+                        move_zim_to_cpu(zim_predictor)
+                        move_model_to_cpu(gd_model)
+                        release_cuda_cache()
                     # FIXME: Treat sky-dominant scenes as all non-sky for now.
                     if sky_mask.float().mean() > 0.9:
                         rank0_log(f"Sky mask is too high for {scene_path} ({sky_mask.float().mean()}), set to all non-sky")
@@ -378,7 +438,12 @@ def run_traj_generate(args):
             full_depth = torch.load(f"{scene_path}/render_results/full_depth_prediction.pt", weights_only=False)
         else:
             with timer.track("Predict panorama depth"):
-                full_depth = pred_pano_depth(depth_model, full_img)
+                depth_model.to(device)
+                try:
+                    full_depth = pred_pano_depth(depth_model, full_img)
+                finally:
+                    move_model_to_cpu(depth_model)
+                    release_cuda_cache()
                 edge_mask = torch.from_numpy(u3d.depth_edge(full_depth["distance"].cpu().numpy(), rtol=0.1)).bool()
                 sky_mask_for_depth = sky_mask
                 if sky_mask_for_depth.shape != edge_mask.shape:
@@ -811,6 +876,18 @@ def run_traj_generate(args):
 
             # processing object segmentation and masking
             if unique_objects:
+                # Stage 1 is complete.  Navigation-mask geometry helpers already
+                # convert these tensors to NumPy, so retaining native-resolution
+                # depth/rays on CUDA only steals memory from SAM3.
+                full_depth["distance"] = full_depth["distance"].cpu()
+                full_depth["rays"] = full_depth["rays"].cpu()
+                full_mask = full_mask.cpu()
+                sky_mask = sky_mask.cpu()
+                move_zim_to_cpu(zim_predictor)
+                move_model_to_cpu(gd_model)
+                move_model_to_cpu(depth_model)
+                release_cuda_cache()
+
                 img_w, img_h = full_img.size
                 occupancy_map = np.zeros((img_h, img_w), dtype=bool)
                 valid_masks_vis = []
@@ -833,6 +910,8 @@ def run_traj_generate(args):
                         device,
                         local_files_only=args.local_files_only,
                     )
+                else:
+                    sam3_model.to(device)
                 for batch_index, batch_objects in enumerate(sam_batches, start=1):
                     batch_images = [full_img] * len(batch_objects)
                     print(
@@ -842,9 +921,16 @@ def run_traj_generate(args):
                     batch_started = time.perf_counter()
                     with timer.track("SAM3 segmentation"):
                         inputs = sam3_processor(images=batch_images, text=batch_objects, return_tensors="pt").to(device)
-                        with torch.no_grad():
+                        with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.float16):
                             outputs = sam3_model(**inputs)
+                        # Transformers expands and casts masks in the post-
+                        # processor.  At native panorama resolution that can be
+                        # gigabytes, so make that allocation in system RAM.
+                        outputs = move_output_tensors_to_cpu(outputs)
+                        del inputs
+                        release_cuda_cache()
                         results = sam3_processor.post_process_instance_segmentation(outputs, threshold=0.4, mask_threshold=0.5, target_sizes=[full_img.size[::-1]] * len(batch_objects))
+                        del outputs
                     raw_masks = sum(len(res.get("masks", [])) for res in results)
                     print(
                         f"[HYWorld2 TrajGenerate] SAM3 batch {batch_index}/{len(sam_batches)} complete: "
@@ -976,6 +1062,11 @@ def run_traj_generate(args):
                             valid_masks_vis.append(mask)
                             valid_labels_vis.append(label)
                             valid_directions_vis.append(direction_label)
+
+                # Nothing after segmentation needs the SAM3 weights.  Keep the
+                # CPU copy for another scene but return all of its VRAM now.
+                move_model_to_cpu(sam3_model)
+                release_cuda_cache()
 
                 with timer.track("Processing object masks (ranking)"):
                     segmentation_data, _ = get_topk_seg_data(segmentation_data, topk=999)  # Sort only.
