@@ -230,6 +230,8 @@ app.registerExtension({
                         const previewSizeMb = message.preview_file_size_mb?.[0] || fileSizeMb;
                         const previewFormat = message.preview_format?.[0] || "ply";
                         const coordinateBasis = normalizeCoordinateBasis(message.coordinate_basis?.[0]);
+                        const basisDiagnosticVersion = message.basis_diagnostic_version?.[0] || "missing";
+                        console.log("[HYWorld2 BasisDiag] frontend extension version:", basisDiagnosticVersion);
 
                         // Extract camera parameters if provided
                         const extrinsics = message.extrinsics?.[0] || null;
@@ -244,6 +246,8 @@ app.registerExtension({
                                 <span>${fileSizeMb} MB</span>
                                 <span style="color: #888;">Preview:</span>
                                 <span>${previewFormat.toUpperCase()} · ${previewSizeMb} MB</span>
+                                <span style="color: #888;">Basis diag:</span>
+                                <span>${basisDiagnosticVersion}</span>
                             </div>
                         `;
 

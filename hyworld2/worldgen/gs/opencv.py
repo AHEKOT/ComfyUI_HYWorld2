@@ -602,6 +602,7 @@ class Parser:
 
         # Convert extrinsics to camera-to-world.
         camtoworlds = np.linalg.inv(w2c_mats)
+        raw_first_c2w = camtoworlds[0].copy()
 
         # Previous Nerf results were generated with images sorted by filename,
         # ensure metrics are reported on the same test set.
@@ -880,6 +881,26 @@ class Parser:
             self.center_point = self.center_point.reshape(3)
         else:
             transform = np.eye(4)
+
+        if self.world_rank == 0:
+            np.set_printoptions(precision=6, suppress=True)
+            print(f"[HYWorld2 BasisDiag] normalize={bool(normalize)}")
+            print(f"[HYWorld2 BasisDiag] raw_first_c2w=\n{raw_first_c2w}")
+            print(f"[HYWorld2 BasisDiag] parser_transform=\n{transform}")
+            print(f"[HYWorld2 BasisDiag] final_first_c2w=\n{camtoworlds[0]}")
+            print(
+                "[HYWorld2 BasisDiag] rotations: "
+                f"raw_det={np.linalg.det(raw_first_c2w[:3, :3]):.6f}, "
+                f"transform_det={np.linalg.det(transform[:3, :3]):.6f}, "
+                f"final_det={np.linalg.det(camtoworlds[0, :3, :3]):.6f}"
+            )
+            print(
+                "[HYWorld2 BasisDiag] final camera axes (world): "
+                f"right={camtoworlds[0, :3, 0].tolist()}, "
+                f"down={camtoworlds[0, :3, 1].tolist()}, "
+                f"forward={camtoworlds[0, :3, 2].tolist()}, "
+                f"center={camtoworlds[0, :3, 3].tolist()}"
+            )
 
         print(f"[Rank{self.world_rank}] up_direction:", self.up_direction)
         print(f"[Rank{self.world_rank}] facing_direction:", self.facing_direction)

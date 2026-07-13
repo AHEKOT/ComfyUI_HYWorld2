@@ -149,7 +149,7 @@
     </div>
 
     <!-- Load bundled gsplat.js -->
-    <script src="./gsplat-bundle.js"></script>
+    <script src="./gsplat-bundle.js?v=basis-diag-v5-root-basis-20260713"></script>
 
     <script type="module">
         // Use the globally exported GSPLAT
@@ -586,9 +586,9 @@
                 console.log('[GaussianViewer] Pivot distance from camera:', pivotDistance.toFixed(4));
             }
 
-            // SHARP uses Y-down coordinate system, so flip camera Y as well
-            camPosY = -camPosY;
-            forwardY = -forwardY;
+            // The backend has already converted both the splat and camera pose
+            // into the same WorldMirror/OpenCV basis (screen up is world -Y).
+            // A camera-only Y flip would separate the camera from the splat basis.
 
             const camPos = new SPLAT.Vector3(camPosX, camPosY, camPosZ);
             const targetPos = new SPLAT.Vector3(
@@ -1140,9 +1140,12 @@
             setFullscreenFlight(Boolean(document.fullscreenElement));
         });
 
+        const VIEWER_BASIS_DIAGNOSTIC_VERSION = 'basis-diag-v5-root-basis-20260713';
+
         // Listen for messages from parent
         window.addEventListener('message', (event) => {
             console.log('[GaussianViewer] 📨 Received message from parent:', event.data.type);
+            console.log('[HYWorld2 BasisDiag] iframe viewer version:', VIEWER_BASIS_DIAGNOSTIC_VERSION);
             const { type, data, filename, format, extrinsics, intrinsics, coordinateBasis } = event.data;
 
             if (type === 'LOAD_MESH_DATA' && data) {

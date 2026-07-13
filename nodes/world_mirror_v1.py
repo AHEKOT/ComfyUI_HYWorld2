@@ -239,7 +239,7 @@ def _quat_wxyz_multiply(a, b):
 def _preview_worldmirror_basis_cache_path(ply_path):
     path = Path(ply_path)
     stat = path.stat()
-    key = f"basis_v2:{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}".encode("utf-8", errors="ignore")
+    key = f"basis_v3_opencv_y_down:{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}".encode("utf-8", errors="ignore")
     digest = hashlib.sha256(key).hexdigest()[:16]
     cache_dir = Path(folder_paths.get_temp_directory()) / "hyworld2_preview_basis"
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -302,16 +302,16 @@ def _convert_gaussian_ply_to_worldmirror_preview_basis(ply_path):
     old_y = vertices["y"].copy()
     old_z = vertices["z"].copy()
     vertices["x"] = old_x
-    vertices["y"] = old_z
-    vertices["z"] = -old_y
+    vertices["y"] = -old_z
+    vertices["z"] = old_y
 
     if {"nx", "ny", "nz"}.issubset(prop_names):
         old_nx = vertices["nx"].copy()
         old_ny = vertices["ny"].copy()
         old_nz = vertices["nz"].copy()
         vertices["nx"] = old_nx
-        vertices["ny"] = old_nz
-        vertices["nz"] = -old_ny
+        vertices["ny"] = -old_nz
+        vertices["nz"] = old_ny
 
     rot_names = ["rot_0", "rot_1", "rot_2", "rot_3"]
     if set(rot_names).issubset(prop_names):
@@ -319,7 +319,7 @@ def _convert_gaussian_ply_to_worldmirror_preview_basis(ply_path):
         norms = np.linalg.norm(quats, axis=1, keepdims=True)
         valid = norms[:, 0] > 1e-8
         quats[valid] = quats[valid] / norms[valid]
-        basis_quat = np.array([np.sqrt(0.5), -np.sqrt(0.5), 0.0, 0.0], dtype=np.float32)
+        basis_quat = np.array([np.sqrt(0.5), np.sqrt(0.5), 0.0, 0.0], dtype=np.float32)
         quats[valid] = _quat_wxyz_multiply(basis_quat, quats[valid])
         for idx, name in enumerate(rot_names):
             vertices[name] = quats[:, idx]
@@ -2126,7 +2126,9 @@ class VNCCS_BackgroundPreview:
 
     def _infer_coordinate_basis(self, ply_path, coordinate_basis="auto"):
         requested = self._normalize_coordinate_basis(coordinate_basis)
+        print(f"[HYWorld2 BasisDiag] Preview requested_basis={requested}, ply={ply_path}")
         if requested != "auto":
+            print(f"[HYWorld2 BasisDiag] Preview resolved_basis={requested} (explicit)")
             return requested
         try:
             path = Path(ply_path)
@@ -2141,13 +2143,17 @@ class VNCCS_BackgroundPreview:
                 with open(candidate, "r", encoding="utf-8") as handle:
                     data = json.load(handle)
                 basis = data.get("ply_basis") or data.get("camera_pose_basis")
+                print(f"[HYWorld2 BasisDiag] Preview metadata={candidate}, declared_basis={basis!r}")
                 if isinstance(basis, str):
                     basis = basis.lower()
                     if "hyworld2" in basis:
+                        print("[HYWorld2 BasisDiag] Preview resolved_basis=hyworld2_worldgen (metadata)")
                         return "hyworld2_worldgen"
                     if "worldmirror" in basis:
+                        print("[HYWorld2 BasisDiag] Preview resolved_basis=worldmirror (metadata)")
                         return "worldmirror"
             if (path.parent / "trainer_cameras.json").exists() or path.name.startswith("point_cloud_"):
+                print("[HYWorld2 BasisDiag] Preview resolved_basis=hyworld2_worldgen (filename fallback)")
                 return "hyworld2_worldgen"
         except Exception as exc:
             print(f"[VNCCS_BackgroundPreview] coordinate_basis auto-detect skipped: {type(exc).__name__}: {exc}")
@@ -2159,8 +2165,8 @@ class VNCCS_BackgroundPreview:
         basis = torch.tensor(
             [
                 [1.0, 0.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 0.0],
-                [0.0, -1.0, 0.0, 0.0],
+                [0.0, 0.0, -1.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
                 [0.0, 0.0, 0.0, 1.0],
             ],
             dtype=poses.dtype,
@@ -2198,6 +2204,15 @@ class VNCCS_BackgroundPreview:
         w2c = torch.eye(4, dtype=c2w.dtype)
         w2c[:3, :3] = R.T
         w2c[:3, 3] = -(R.T @ t)
+        print(f"[HYWorld2 BasisDiag] Preview camera_coordinate_basis={coordinate_basis}")
+        print(f"[HYWorld2 BasisDiag] Preview representative_c2w=\n{c2w.numpy()}")
+        print(f"[HYWorld2 BasisDiag] Preview emitted_w2c=\n{w2c.numpy()}")
+        print(
+            "[HYWorld2 BasisDiag] Preview camera axes: "
+            f"right={c2w[:3, 0].tolist()}, down={c2w[:3, 1].tolist()}, "
+            f"forward={c2w[:3, 2].tolist()}, center={c2w[:3, 3].tolist()}, "
+            f"det={torch.det(c2w[:3, :3]).item():.6f}"
+        )
         return w2c.tolist()
 
     def _view_info_for_path(self, path):
@@ -2332,6 +2347,7 @@ class VNCCS_BackgroundPreview:
             "preview_file_size_mb": [preview_info["size_mb"]],
             "preview_format": [preview_format],
             "coordinate_basis": [frontend_coordinate_basis],
+            "basis_diagnostic_version": ["basis-diag-v5-root-basis-20260713"],
         }
         
         # Add camera parameters if provided

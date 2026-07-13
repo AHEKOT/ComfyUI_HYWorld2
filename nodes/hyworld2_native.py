@@ -870,8 +870,8 @@ def _to_intrinsics(intrs):
 _WORLDSTEREO_TO_WORLDMIRROR_BASIS = torch.tensor(
     [
         [1.0, 0.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, -1.0, 0.0, 0.0],
+        [0.0, 0.0, -1.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
         [0.0, 0.0, 0.0, 1.0],
     ],
     dtype=torch.float32,
@@ -981,8 +981,8 @@ def _convert_trainer_gaussian_ply_to_worldmirror_basis(ply_path):
     old_y = vertices["y"].copy()
     old_z = vertices["z"].copy()
     vertices["x"] = old_x
-    vertices["y"] = old_z
-    vertices["z"] = -old_y
+    vertices["y"] = -old_z
+    vertices["z"] = old_y
 
     rot_names = ["rot_0", "rot_1", "rot_2", "rot_3"]
     if set(rot_names).issubset(prop_names):
@@ -990,7 +990,7 @@ def _convert_trainer_gaussian_ply_to_worldmirror_basis(ply_path):
         norms = np.linalg.norm(quats, axis=1, keepdims=True)
         valid = norms[:, 0] > 1e-8
         quats[valid] = quats[valid] / norms[valid]
-        basis_quat = np.array([np.sqrt(0.5), -np.sqrt(0.5), 0.0, 0.0], dtype=np.float32)
+        basis_quat = np.array([np.sqrt(0.5), np.sqrt(0.5), 0.0, 0.0], dtype=np.float32)
         quats[valid] = _quat_wxyz_multiply(basis_quat, quats[valid])
         for idx, name in enumerate(rot_names):
             vertices[name] = quats[:, idx]
@@ -4163,6 +4163,12 @@ class HYWorld2Train3DGS:
             },
             "official_hyworld2_stage5_profile": True,
             "convert_ply_to_worldmirror_preview_basis": bool(convert_ply_to_worldmirror_preview_basis),
+            # Background Preview uses these fields to decide whether a basis
+            # conversion is still required.  Without them, an already-converted
+            # point_cloud_*.ply was detected by filename as HYWorld2 and rotated
+            # a second time.
+            "ply_basis": "worldmirror" if bool(convert_ply_to_worldmirror_preview_basis) else "hyworld2_worldgen",
+            "camera_pose_basis": "worldmirror_c2w" if bool(convert_ply_to_worldmirror_preview_basis) else "hyworld2_worldgen_c2w",
             "lpips_net": cfg.lpips_net,
             "in_process": True,
         }

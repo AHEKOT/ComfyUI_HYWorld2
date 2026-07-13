@@ -1536,6 +1536,73 @@ def _wan_base_aux_ready(base_model_dir: str, components) -> bool:
     return all(os.path.exists(path) for path in checks)
 
 
+def _hf_component_weights_ready(component_dir: str) -> bool:
+    """Return True only when a local HF component has all indexed weight shards."""
+    if not os.path.isfile(os.path.join(component_dir, "config.json")):
+        return False
+
+    for index_name in (
+        "model.safetensors.index.json",
+        "pytorch_model.bin.index.json",
+        "diffusion_pytorch_model.safetensors.index.json",
+        "diffusion_pytorch_model.bin.index.json",
+    ):
+        index_path = os.path.join(component_dir, index_name)
+        if not os.path.isfile(index_path):
+            continue
+        try:
+            with open(index_path, "r", encoding="utf-8") as fh:
+                weight_map = json.load(fh).get("weight_map", {})
+            shards = set(weight_map.values())
+            return bool(shards) and all(os.path.isfile(os.path.join(component_dir, shard)) for shard in shards)
+        except Exception:
+            return False
+
+    return any(
+        os.path.isfile(os.path.join(component_dir, filename))
+        for filename in (
+            "model.safetensors",
+            "pytorch_model.bin",
+            "diffusion_pytorch_model.safetensors",
+            "diffusion_pytorch_model.bin",
+        )
+    )
+
+
+def _worldstereo_light_aux_missing(base_model_dir: str, model_type: str) -> list[str]:
+    """Validate files actually read by WorldStereoLight without consulting HF."""
+    missing = []
+
+    exact_files = {
+        "transformer/config.json": os.path.join(base_model_dir, "transformer", "config.json"),
+        "vae/config.json": os.path.join(base_model_dir, "vae", "config.json"),
+        "image_processor/preprocessor_config.json": os.path.join(
+            base_model_dir, "image_processor", "preprocessor_config.json"
+        ),
+        "tokenizer/tokenizer_config.json": os.path.join(base_model_dir, "tokenizer", "tokenizer_config.json"),
+    }
+    for label, path in exact_files.items():
+        if not os.path.isfile(path):
+            missing.append(label)
+
+    tokenizer_dir = os.path.join(base_model_dir, "tokenizer")
+    if not any(
+        os.path.isfile(os.path.join(tokenizer_dir, filename))
+        for filename in ("tokenizer.json", "spiece.model", "tokenizer.model")
+    ):
+        missing.append("tokenizer vocabulary")
+
+    if not _hf_component_weights_ready(os.path.join(base_model_dir, "image_encoder")):
+        missing.append("image_encoder weights/config")
+
+    if model_type in ("worldstereo-camera", "worldstereo-memory"):
+        scheduler_config = os.path.join(base_model_dir, "scheduler", "scheduler_config.json")
+        if not os.path.isfile(scheduler_config):
+            missing.append("scheduler/scheduler_config.json")
+
+    return missing
+
+
 def _resolve_wan_base_aux(components, models_base: str | None = None) -> str:
     base_model_dir = os.path.join(models_base or _get_models_base(), "Wan2.1-I2V-14B-480P")
     if _wan_base_aux_ready(base_model_dir, components):
@@ -1579,20 +1646,32 @@ def _download_worldstereo_single_loader_components(
         print(f"[WorldStereo] WorldStereo config cached: {config_path}")
 
     base_model_dir = os.path.join(base, "Wan2.1-I2V-14B-480P")
-    _download_hf_repo_missing(
-        repo_id="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
-        local_dir=base_model_dir,
-        label="Wan2.1-I2V-14B-480P aux files",
-        allow_patterns=[
-            "model_index.json",
-            "scheduler/**",
-            "tokenizer/**",
-            "image_encoder/**",
-            "image_processor/**",
-            "vae/config.json",
-            "transformer/config.json",
-        ],
-    )
+    missing_aux = _worldstereo_light_aux_missing(base_model_dir, model_type)
+    if not missing_aux:
+        print(f"[WorldStereoLight] Using complete local Wan aux files: {base_model_dir}")
+    else:
+        print(f"[WorldStereoLight] Local Wan aux incomplete; missing: {', '.join(missing_aux)}")
+        try:
+            _download_hf_repo_missing(
+                repo_id="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+                local_dir=base_model_dir,
+                label="Wan2.1-I2V-14B-480P aux files",
+                allow_patterns=[
+                    "model_index.json",
+                    "scheduler/**",
+                    "tokenizer/**",
+                    "image_encoder/**",
+                    "image_processor/**",
+                    "vae/config.json",
+                    "transformer/config.json",
+                ],
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "WorldStereoLight cannot complete the local Wan auxiliary model while offline. "
+                f"Missing before download: {', '.join(missing_aux)}. "
+                f"Local directory: {base_model_dir}"
+            ) from exc
 
     moge_dir = os.path.join(base, "MoGe")
     if include_moge:
@@ -2120,6 +2199,7 @@ class VNCCS_LoadWorldStereoLightModel:
                 parent_dir,
                 single_model_path,
                 subfolder=model_type,
+                local_files_only=True,
                 device=device,
                 model_device=model_device,
                 text_encoder_path=text_encoder_path,

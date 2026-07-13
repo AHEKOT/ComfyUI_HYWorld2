@@ -1182,6 +1182,25 @@ class Runner:
                 bkgd = torch.tensor(background_color, device=device, dtype=torch.float32).reshape(1, 3) / 255
                 colors = colors + bkgd * (1.0 - alphas)
 
+            # Guaranteed orientation diagnostic even when the validation split
+            # is empty.  Run only on configured eval/PLY checkpoints so it has
+            # negligible impact on training.
+            if self.world_rank == 0 and (step in eval_steps or step in ply_steps):
+                with torch.no_grad():
+                    train_orientation_l1 = {
+                        "identity": torch.mean(torch.abs(colors[..., :3] - pixels)).item(),
+                        "horizontal_flip": torch.mean(torch.abs(colors[..., :3] - torch.flip(pixels, dims=(2,)))).item(),
+                        "vertical_flip": torch.mean(torch.abs(colors[..., :3] - torch.flip(pixels, dims=(1,)))).item(),
+                        "rotate_180": torch.mean(torch.abs(colors[..., :3] - torch.flip(pixels, dims=(1, 2)))).item(),
+                    }
+                best_orientation = min(train_orientation_l1, key=train_orientation_l1.get)
+                batch_names = data.get("image_name", ["<unknown>"])
+                image_name = batch_names[0] if isinstance(batch_names, (list, tuple)) else str(batch_names)
+                print(
+                    f"[HYWorld2 BasisDiag] train checkpoint step={step} image={image_name} "
+                    f"orientation_l1={train_orientation_l1} best={best_orientation}"
+                )
+
             self.cfg.strategy.step_pre_backward(
                 params=self.splats,
                 optimizers=self.optimizers,
@@ -2019,6 +2038,21 @@ class Runner:
             canvas_list = [pixels, colors]
 
             if world_rank == 0:
+                orientation_l1 = {
+                    "identity": torch.mean(torch.abs(colors - pixels)).item(),
+                    "horizontal_flip": torch.mean(torch.abs(colors - torch.flip(pixels, dims=(2,)))).item(),
+                    "vertical_flip": torch.mean(torch.abs(colors - torch.flip(pixels, dims=(1,)))).item(),
+                    "rotate_180": torch.mean(torch.abs(colors - torch.flip(pixels, dims=(1, 2)))).item(),
+                }
+                for name, value in orientation_l1.items():
+                    metrics[f"orientation_l1_{name}"].append(torch.tensor(value))
+                if i == 0:
+                    best_orientation = min(orientation_l1, key=orientation_l1.get)
+                    image_name = data.get("image_name", ["<unknown>"])[0]
+                    print(
+                        f"[HYWorld2 BasisDiag] eval step={step} image={image_name} "
+                        f"orientation_l1={orientation_l1} best={best_orientation}"
+                    )
                 # write images
                 canvas = torch.cat(canvas_list, dim=2)[0].cpu().numpy()
                 canvas = (canvas * 255).astype(np.uint8)
