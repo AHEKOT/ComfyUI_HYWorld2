@@ -290,7 +290,8 @@ def run_traj_generate(args):
             print(f"Delete existing {scene_path}/render_results")
             render_results_list = glob(f"{scene_path}/render_results/*")
             render_results_list = [r for r in render_results_list if r.split('/')[-1] not in ("full_depth_prediction.pt", "global_mesh.ply",
-                                                                                              "global_normal.npy", "global_pcd.ply", "sky_mask.png", "sky_pcd.ply")]
+                                                                                              "global_normal.npy", "global_pcd.ply", "sky_mask.png", "sky_pcd.ply",
+                                                                                              "panorama_source_meta.json")]
             for path in render_results_list:
                 if os.path.isdir(path):
                     shutil.rmtree(path)
@@ -301,10 +302,38 @@ def run_traj_generate(args):
 
         image_path = f"{scene_path}/panorama_sr.png" if os.path.exists(f"{scene_path}/panorama_sr.png") else f"{scene_path}/panorama.png"
 
-        full_img = Image.open(image_path)
-        if full_img.size[1] > 1920:
-            full_img = full_img.resize((3840, 1920), resample=Image.Resampling.BICUBIC)
+        # Keep the source panorama at its native resolution. The previous
+        # 3840x1920 clamp silently downscaled large panoramas before any views
+        # were extracted and upscaled smaller non-standard sources.
+        full_img = Image.open(image_path).convert("RGB")
         width_origin, height_origin = full_img.size
+        source_meta_path = f"{scene_path}/render_results/panorama_source_meta.json"
+        source_meta = {
+            "path": os.path.abspath(image_path),
+            "width": int(width_origin),
+            "height": int(height_origin),
+            "file_size": int(os.path.getsize(image_path)),
+            "mtime_ns": int(os.stat(image_path).st_mtime_ns),
+            "native_resolution_pipeline": 2,
+        }
+        old_source_meta = None
+        if os.path.exists(source_meta_path):
+            try:
+                old_source_meta = json.load(open(source_meta_path, "r", encoding="utf-8"))
+            except Exception:
+                old_source_meta = None
+        if old_source_meta != source_meta:
+            print("Panorama source/resolution changed; invalidating derived geometry caches.")
+            for cache_name in (
+                "full_depth_prediction.pt", "global_pcd.ply", "global_mesh.ply",
+                "global_normal.npy", "sky_pcd.ply", "sky_mask.png",
+            ):
+                cache_path = f"{scene_path}/render_results/{cache_name}"
+                if os.path.exists(cache_path):
+                    os.remove(cache_path)
+            os.makedirs(f"{scene_path}/render_results", exist_ok=True)
+            with open(source_meta_path, "w", encoding="utf-8") as handle:
+                json.dump(source_meta, handle, indent=2)
 
         # get meta info prepared by HYWorld2Trajectories. No direct OpenAI/vLLM calls are allowed here.
         meta_path = f"{scene_path}/meta_info.json"
@@ -457,7 +486,16 @@ def run_traj_generate(args):
         ))
         image_h, image_w = adjust_image_size(image_h, image_w)
 
-        print(f"Image size: {image_h}x{image_w}")
+        # Perspective source views are independent from the inexpensive point
+        # render size. Match their angular pixel density to the native ERP so
+        # a 90-degree view uses exactly one quarter of the panorama width.
+        panorama_view_w = max(1, int(round(width_origin * float(args.fov_x) / 360.0)))
+        panorama_view_h = max(1, int(round(height_origin * float(args.fov_y) / 180.0)))
+
+        print(
+            f"Trajectory render size: {image_w}x{image_h}; native panorama view size: "
+            f"{panorama_view_w}x{panorama_view_h} from ERP {width_origin}x{height_origin}"
+        )
 
         # Sampling polar views
         with timer.track("Sampling polar views"):
@@ -475,9 +513,9 @@ def run_traj_generate(args):
             splitted_extrinsics = u3d.extrinsics_look_at(np.array([0, 0, 0]), direct_points, np.array([0, 0, 1])).astype(np.float32)
 
             # build polar bank
-            splitted_images = split_panorama_image(np.array(full_img), splitted_extrinsics, splitted_intrinsics, h=image_h, w=image_w, interp=cv2.INTER_AREA)
-            splitted_depths = split_panorama_depth(np.array(full_depth["distance"].cpu()), splitted_extrinsics, splitted_intrinsics, h=image_h, w=image_w, distance_to_depth=True)
-            splitted_masks = split_panorama_depth(~np.array(full_mask.cpu()), splitted_extrinsics, splitted_intrinsics, h=image_h, w=image_w)
+            splitted_images = split_panorama_image(np.array(full_img), splitted_extrinsics, splitted_intrinsics, h=panorama_view_h, w=panorama_view_w, interp=cv2.INTER_LINEAR)
+            splitted_depths = split_panorama_depth(np.array(full_depth["distance"].cpu()), splitted_extrinsics, splitted_intrinsics, h=panorama_view_h, w=panorama_view_w, distance_to_depth=True)
+            splitted_masks = split_panorama_depth(~np.array(full_mask.cpu()), splitted_extrinsics, splitted_intrinsics, h=panorama_view_h, w=panorama_view_w)
 
         # save polar set
         save_tasks = []
@@ -493,11 +531,11 @@ def run_traj_generate(args):
                 depth[~depth_mask] = 0
                 depth = depth[0]
                 K = splitted_intrinsics[i].copy()
-                K[0] *= image_w
-                K[1] *= image_h
+                K[0] *= panorama_view_w
+                K[1] *= panorama_view_h
                 bank_cameras[fname] = {
                     "intrinsic": K.tolist(), "extrinsic": splitted_extrinsics[i].tolist(),
-                    "width": image_w, "height": image_h,
+                    "width": panorama_view_w, "height": panorama_view_h,
                     "fov_x": float(args.fov_x), "fov_y": float(args.fov_y),
                 }
 
@@ -535,9 +573,9 @@ def run_traj_generate(args):
             splitted_extrinsics = u3d.extrinsics_look_at(np.array([0, 0, 0]), direct_points, np.array([0, 0, 1])).astype(np.float32)
 
             # build memory bank
-            splitted_images = split_panorama_image(np.array(full_img), splitted_extrinsics, splitted_intrinsics, h=image_h, w=image_w, interp=cv2.INTER_AREA)
-            splitted_depths = split_panorama_depth(np.array(full_depth["distance"].cpu()), splitted_extrinsics, splitted_intrinsics, h=image_h, w=image_w, distance_to_depth=True)
-            splitted_masks = split_panorama_depth(~np.array(full_mask.cpu()), splitted_extrinsics, splitted_intrinsics, h=image_h, w=image_w)
+            splitted_images = split_panorama_image(np.array(full_img), splitted_extrinsics, splitted_intrinsics, h=panorama_view_h, w=panorama_view_w, interp=cv2.INTER_LINEAR)
+            splitted_depths = split_panorama_depth(np.array(full_depth["distance"].cpu()), splitted_extrinsics, splitted_intrinsics, h=panorama_view_h, w=panorama_view_w, distance_to_depth=True)
+            splitted_masks = split_panorama_depth(~np.array(full_mask.cpu()), splitted_extrinsics, splitted_intrinsics, h=panorama_view_h, w=panorama_view_w)
 
         save_tasks = []
         with timer.track("[IO] Save panorama views"):
@@ -553,11 +591,11 @@ def run_traj_generate(args):
                 depth[~depth_mask] = 0
                 depth = depth[0]
                 K = splitted_intrinsics[i].copy()
-                K[0] *= image_w
-                K[1] *= image_h
+                K[0] *= panorama_view_w
+                K[1] *= panorama_view_h
                 bank_cameras[fname] = {
                     "intrinsic": K.tolist(), "extrinsic": splitted_extrinsics[i].tolist(),
-                    "width": image_w, "height": image_h,
+                    "width": panorama_view_w, "height": panorama_view_h,
                     "fov_x": float(args.fov_x), "fov_y": float(args.fov_y),
                 }
 
@@ -601,9 +639,9 @@ def run_traj_generate(args):
             splitted_intrinsics = [intrinsics] * len(direct_points)
             splitted_extrinsics = u3d.extrinsics_look_at(np.array([0, 0, 0]), direct_points, np.array([0, 0, 1])).astype(np.float32)
 
-            splitted_images = split_panorama_image(np.array(full_img), splitted_extrinsics, splitted_intrinsics, h=image_h, w=image_w, interp=cv2.INTER_AREA)
-            splitted_depths = split_panorama_depth(np.array(full_depth["distance"].cpu()), splitted_extrinsics, splitted_intrinsics, h=image_h, w=image_w, distance_to_depth=True)
-            splitted_masks = split_panorama_depth(~np.array(full_mask.cpu()), splitted_extrinsics, splitted_intrinsics, h=image_h, w=image_w)
+            splitted_images = split_panorama_image(np.array(full_img), splitted_extrinsics, splitted_intrinsics, h=panorama_view_h, w=panorama_view_w, interp=cv2.INTER_LINEAR)
+            splitted_depths = split_panorama_depth(np.array(full_depth["distance"].cpu()), splitted_extrinsics, splitted_intrinsics, h=panorama_view_h, w=panorama_view_w, distance_to_depth=True)
+            splitted_masks = split_panorama_depth(~np.array(full_mask.cpu()), splitted_extrinsics, splitted_intrinsics, h=panorama_view_h, w=panorama_view_w)
 
         mesh = o3d.geometry.TriangleMesh()
         mesh.vertices = o3d.utility.Vector3dVector(np.asarray(global_mesh.vertices))
@@ -639,10 +677,10 @@ def run_traj_generate(args):
                 splitted_image = Image.fromarray(splitted_images[i])
 
                 projected_points, projected_colors, projected_uv = get_view_point_from_panorama_point(
-                    global_pcd, splitted_extrinsics[i], splitted_intrinsics[i], image_h, image_w
+                    global_pcd, splitted_extrinsics[i], splitted_intrinsics[i], panorama_view_h, panorama_view_w
                 )
                 projected_pcd = trimesh.PointCloud(vertices=projected_points, colors=projected_colors)
-                point_mask = np.zeros((image_h, image_w), dtype=np.uint8)
+                point_mask = np.zeros((panorama_view_h, panorama_view_w), dtype=np.uint8)
                 point_mask[projected_uv[:, 1], projected_uv[:, 0]] = 255
                 point_mask_img = Image.fromarray(point_mask)
 
@@ -1191,7 +1229,10 @@ def run_traj_generate(args):
                     K_pano = K.astype(np.float64)
                     K_pano[0, :] /= image_w
                     K_pano[1, :] /= image_h
-                    splitted_images = split_panorama_image(np.array(full_img), w2cs[0:1], np.array([K_pano]), h=image_h, w=image_w, interp=cv2.INTER_AREA)
+                    splitted_images = split_panorama_image(
+                        np.array(full_img), w2cs[0:1], np.array([K_pano]),
+                        h=panorama_view_h, w=panorama_view_w, interp=cv2.INTER_LINEAR,
+                    )
 
                     out_dir = f"{scene_path}/render_results/{folder_name}/traj0"
                     os.makedirs(out_dir, exist_ok=True)

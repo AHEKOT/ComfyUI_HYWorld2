@@ -175,6 +175,11 @@ class Config:
     patch_size: Optional[int] = None
     # Step-based crop schedule, e.g. "0:256,1500:384,3500:full".
     progressive_patch_schedule: str = ""
+    # Safety cap for "full" training on mixed/native-resolution datasets.
+    # Images smaller than the cap are still used in full.
+    max_train_patch_size: int = 768
+    # Evaluation renders are resized with matching intrinsics above this side.
+    eval_max_side: int = 768
     # A global scaler that applies to the scene size related parameters
     global_scale: float = 1.0
     # Normalize the world space
@@ -933,6 +938,13 @@ class Runner:
             local_rank=self.local_rank,
             align_sky_only=cfg.init_align_sky_only,
         )
+        dataset_sizes = set(self.parser.imsize_dict.values())
+        if len(dataset_sizes) > 1 and int(cfg.batch_size) > 1:
+            print(
+                f"[HYWorld2 Train 3DGS] Mixed-resolution dataset {sorted(dataset_sizes)} "
+                f"requires batch_size=1; overriding requested batch_size={cfg.batch_size}."
+            )
+            cfg.batch_size = 1
 
         self.trainset = Dataset(
             self.parser,
@@ -1359,6 +1371,8 @@ class Runner:
                 tic = time.time()
 
             scheduled_patch = _scheduled_value(patch_schedule, step, cfg.patch_size)
+            if scheduled_patch is None and int(cfg.max_train_patch_size) > 0:
+                scheduled_patch = int(cfg.max_train_patch_size)
             if self.trainset.patch_size != scheduled_patch:
                 self.trainset.patch_size = scheduled_patch
                 if self.world_rank == 0:
@@ -2101,9 +2115,25 @@ class Runner:
                     heights = [self.parser.imsize_dict[cid][1] for cid in self.parser.camera_ids]
 
                     rgbmaps, depthmaps = [], []
+                    mesh_render_Ks, mesh_render_widths, mesh_render_heights = [], [], []
                     for j in tqdm.tqdm(range(camtoworlds_mesh.shape[0]), desc="Rendering RGB and depth maps", disable=self.world_rank != 0):
                         c2w = camtoworlds_mesh[j].copy()[None]
                         K = Ks_mesh[j].copy()[None]
+                        render_w, render_h = int(widths[j]), int(heights[j])
+                        if int(cfg.eval_max_side) > 0 and max(render_w, render_h) > int(cfg.eval_max_side):
+                            scale = float(cfg.eval_max_side) / float(max(render_w, render_h))
+                            target_w = max(1, int(round(render_w * scale)))
+                            target_h = max(1, int(round(render_h * scale)))
+                            K[..., 0, :] *= float(target_w) / float(render_w)
+                            K[..., 1, :] *= float(target_h) / float(render_h)
+                            render_w, render_h = target_w, target_h
+
+                        # TSDF integration must use the dimensions and scaled
+                        # intrinsics of the maps rendered below, not the source
+                        # camera metadata (which may be larger).
+                        mesh_render_Ks.append(K[0].copy())
+                        mesh_render_widths.append(render_w)
+                        mesh_render_heights.append(render_h)
 
                         if isinstance(c2w, np.ndarray):
                             c2w = torch.from_numpy(c2w).float().to(self.device)
@@ -2114,8 +2144,8 @@ class Runner:
                             renders, _, _ = self.rasterize_splats(
                                 camtoworlds=c2w,
                                 Ks=K,
-                                width=widths[j],
-                                height=heights[j],
+                                width=render_w,
+                                height=render_h,
                                 sh_degree=cfg.sh_degree,
                                 near_plane=cfg.near_plane,
                                 far_plane=cfg.far_plane,
@@ -2145,7 +2175,8 @@ class Runner:
                         sdf_trunc = (4.0 * voxel_size) if cfg.sdf_trunc < 0 else cfg.sdf_trunc
 
                         mesh = extract_mesh_bounded(
-                            rgbmaps, depthmaps, camtoworlds_mesh, Ks_mesh, widths, heights,
+                            rgbmaps, depthmaps, camtoworlds_mesh,
+                            mesh_render_Ks, mesh_render_widths, mesh_render_heights,
                             voxel_size=voxel_size, sdf_trunc=sdf_trunc, depth_trunc=depth_trunc,
                         )
 
@@ -2455,6 +2486,21 @@ class Runner:
             pixels = data["image"].to(device) / 255.0
             masks = data["mask"].to(device) if "mask" in data else None
             height, width = pixels.shape[1:3]
+            if int(cfg.eval_max_side) > 0 and max(height, width) > int(cfg.eval_max_side):
+                scale = float(cfg.eval_max_side) / float(max(height, width))
+                target_h = max(1, int(round(height * scale)))
+                target_w = max(1, int(round(width * scale)))
+                pixels = F.interpolate(
+                    pixels.permute(0, 3, 1, 2), size=(target_h, target_w),
+                    mode="area",
+                ).permute(0, 2, 3, 1)
+                Ks[..., 0, :] *= float(target_w) / float(width)
+                Ks[..., 1, :] *= float(target_h) / float(height)
+                if masks is not None:
+                    masks = F.interpolate(
+                        masks[:, None].float(), size=(target_h, target_w), mode="nearest"
+                    )[:, 0].bool()
+                height, width = target_h, target_w
 
             torch.cuda.synchronize()
             tic = time.time()

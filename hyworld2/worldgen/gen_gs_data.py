@@ -17,12 +17,12 @@ from moge.model.v2 import MoGeModel
 from tqdm import tqdm
 
 try:
-    from .src.general_utils import rank0_log, Timer, load_video, save_16bit_png_depth
+    from .src.general_utils import rank0_log, Timer, load_video, load_16bit_png_depth, save_16bit_png_depth
     from .src.panorama_utils import split_panorama_image, split_panorama_depth, rotate_around_z_axis
     from .src.distributed_compat import distributed_backend
     from .src import utils3d_compat as u3d
 except ImportError:
-    from src.general_utils import rank0_log, Timer, load_video, save_16bit_png_depth
+    from src.general_utils import rank0_log, Timer, load_video, load_16bit_png_depth, save_16bit_png_depth
     from src.panorama_utils import split_panorama_image, split_panorama_depth, rotate_around_z_axis
     from src.distributed_compat import distributed_backend
     from src import utils3d_compat as u3d
@@ -41,7 +41,11 @@ def save_io(fname, frame_img, depth_path, normal_map, w2c, K, output_path):
     # Save the RGB frame.
     frame_img.save(img_path)
     if depth_path is not None:
-        shutil.copy(depth_path, depth_target_path)
+        depth = load_16bit_png_depth(depth_path)
+        frame_width, frame_height = frame_img.size
+        if depth.shape[:2] != (frame_height, frame_width):
+            depth = cv2.resize(depth, (frame_width, frame_height), interpolation=cv2.INTER_NEAREST)
+        save_16bit_png_depth(depth, depth_target_path)
 
     if normal_map is not None:
         Image.fromarray(((normal_map + 1.0) / 2.0 * 255.0).astype(np.uint8)).save(normal_path)
@@ -156,6 +160,7 @@ def run_gen_gs_data(
     to_tensor = transforms.ToTensor()
     save_cameras = {}
     img_width, img_height = None, None
+    max_image_width, max_image_height = 0, 0
 
     if no_aerial:
         video_paths = (
@@ -186,6 +191,8 @@ def run_gen_gs_data(
             render_camera = json.load(f)
         w2cs = np.array(render_camera["extrinsic"])
         Ks = np.array(render_camera["intrinsic"])
+        camera_width = int(render_camera.get("width", img_width) or img_width)
+        camera_height = int(render_camera.get("height", img_height) or img_height)
         if w2cs.shape[0] != len(frames):
             if w2cs.shape[0] == 81 and len(frames) == 21:
                 w2cs = w2cs[0::4]
@@ -203,10 +210,15 @@ def run_gen_gs_data(
         indices = indices[:: int(interval)]
         replace_start_frame = not skip_start_frame and not (view_id.startswith("reconstruct_") and traj_id == "traj1")
         if replace_start_frame:
-            frames[0] = Image.open(os.path.join(view_dir, "start_frame.png"))
+            frames[0] = Image.open(os.path.join(view_dir, "start_frame.png")).convert("RGB")
         for i in range(len(frames)):
-            if frames[i].size[0] != img_width or frames[i].size[1] != img_height:
-                frames[i] = frames[i].resize((img_width, img_height), Image.LANCZOS)
+            frames[i] = frames[i].convert("RGB")
+            frame_width, frame_height = frames[i].size
+            frame_K = Ks[i].copy()
+            frame_K[0, :] *= float(frame_width) / float(max(1, camera_width))
+            frame_K[1, :] *= float(frame_height) / float(max(1, camera_height))
+            max_image_width = max(max_image_width, int(frame_width))
+            max_image_height = max(max_image_height, int(frame_height))
             depth_path = f"{scene_path}/render_results/generation_bank_{result_name}/{view_id}/{traj_id}/depths/{indices[i]:04d}.png"
             if not os.path.exists(depth_path):
                 depth_path = None
@@ -217,8 +229,13 @@ def run_gen_gs_data(
             else:
                 normal_map = None
             fname = f"{view_id}-{traj_id}_{indices[i]:06d}"
-            fname, extrinsic, intrinsic = save_io(fname, frames[i], depth_path, normal_map, w2cs[i], Ks[i], output_path)
-            save_cameras[fname] = {"extrinsic": extrinsic, "intrinsic": intrinsic}
+            fname, extrinsic, intrinsic = save_io(fname, frames[i], depth_path, normal_map, w2cs[i], frame_K, output_path)
+            save_cameras[fname] = {
+                "extrinsic": extrinsic,
+                "intrinsic": intrinsic,
+                "width": int(frame_width),
+                "height": int(frame_height),
+            }
 
     if img_width is None or img_height is None:
         pano_bank_images = sorted(glob(f"{scene_path}/render_results/pano_bank/images/*.png"))
@@ -236,10 +253,22 @@ def run_gen_gs_data(
         for image_path in image_list:
             orig_fname = Path(image_path).stem
             fname = f"{prefix}_{orig_fname}"
+            with Image.open(image_path) as source_image:
+                source_width, source_height = source_image.size
+            camera_meta = bank_cameras[orig_fname]
+            camera_width = int(camera_meta.get("width", source_width) or source_width)
+            camera_height = int(camera_meta.get("height", source_height) or source_height)
+            intrinsic = np.asarray(camera_meta["intrinsic"], dtype=np.float32).copy()
+            intrinsic[0, :] *= float(source_width) / float(max(1, camera_width))
+            intrinsic[1, :] *= float(source_height) / float(max(1, camera_height))
             save_cameras[fname] = {
-                "extrinsic": bank_cameras[orig_fname]["extrinsic"],
-                "intrinsic": bank_cameras[orig_fname]["intrinsic"],
+                "extrinsic": camera_meta["extrinsic"],
+                "intrinsic": intrinsic.tolist(),
+                "width": int(source_width),
+                "height": int(source_height),
             }
+            max_image_width = max(max_image_width, int(source_width))
+            max_image_height = max(max_image_height, int(source_height))
             shutil.copy(image_path, f"{output_path}/images/{fname}.png")
             depth_path = f"{bank_path}/depths/{orig_fname}.png"
             if os.path.exists(depth_path):
@@ -251,8 +280,10 @@ def run_gen_gs_data(
                     normal_map = moge_prediction["normal"][0].cpu().numpy()
                 Image.fromarray(((normal_map + 1.0) / 2.0 * 255.0).astype(np.uint8)).save(f"{output_path}/normals/{fname}.png")
 
-    save_cameras["width"] = img_width
-    save_cameras["height"] = img_height
+    # Kept for compatibility with older readers. Per-camera width/height above
+    # are authoritative for mixed-resolution datasets.
+    save_cameras["width"] = int(max_image_width or img_width or 0)
+    save_cameras["height"] = int(max_image_height or img_height or 0)
     with open(f"{output_path}/cameras.json", "w", encoding="utf-8") as handle:
         json.dump(save_cameras, handle, indent=2)
     meta_src = f"{scene_path}/meta_info.json"
@@ -470,6 +501,8 @@ if __name__ == '__main__':
                     render_camera = json.load(f)
                 w2cs = np.array(render_camera["extrinsic"])
                 Ks = np.array(render_camera["intrinsic"])
+                camera_width = int(render_camera.get("width", img_width) or img_width)
+                camera_height = int(render_camera.get("height", img_height) or img_height)
 
                 if w2cs.shape[0] != len(frames):
                     if w2cs.shape[0] == 81 and len(frames) == 21:
@@ -488,6 +521,8 @@ if __name__ == '__main__':
                 frames = frames[::args.interval]
                 w2cs = w2cs[::args.interval]
                 Ks = Ks[::args.interval]
+                Ks[..., 0, :] *= float(img_width) / float(max(1, camera_width))
+                Ks[..., 1, :] *= float(img_height) / float(max(1, camera_height))
                 indices = indices[::args.interval]
 
                 replace_start_frame = not args.skip_start_frame and not (view_id.startswith("reconstruct_") and traj_id == "traj1")

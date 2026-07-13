@@ -294,7 +294,18 @@ def calculate_frustum_volume_overlap(corners1, corners2):
     return overlap_score
 
 
-def calculate_fov_overlap(cam1_intrinsic, cam1_extrinsic, cam2_intrinsic, cam2_extrinsic, image_width, image_height, near, far):
+def calculate_fov_overlap(
+    cam1_intrinsic,
+    cam1_extrinsic,
+    cam2_intrinsic,
+    cam2_extrinsic,
+    image_width,
+    image_height,
+    near,
+    far,
+    cam2_image_width=None,
+    cam2_image_height=None,
+):
     """Calculate FOV overlap between two cameras using frustum intersection
 
     This function constructs frustums from near and far planes and calculates their overlap.
@@ -342,7 +353,11 @@ def calculate_fov_overlap(cam1_intrinsic, cam1_extrinsic, cam2_intrinsic, cam2_e
         cam1_intrinsic, cam1_extrinsic, image_width, image_height, depth_range
     )  # [B, 8, 3]
     corners2 = get_camera_frustum_corners(
-        cam2_intrinsic, cam2_extrinsic, image_width, image_height, depth_range
+        cam2_intrinsic,
+        cam2_extrinsic,
+        image_width if cam2_image_width is None else cam2_image_width,
+        image_height if cam2_image_height is None else cam2_image_height,
+        depth_range,
     )  # [B, 8, 3]
 
     # Calculate frustum overlap (batched)
@@ -357,7 +372,8 @@ def calculate_fov_overlap(cam1_intrinsic, cam1_extrinsic, cam2_intrinsic, cam2_e
 
 def find_closest_camera_in_view(target_extrinsic, ref_extrinsics, target_intrinsic, ref_intrinsics,
                                 image_width, image_height, method="distance", near=0.1, far=5.0, angle_penalty=False,
-                                shortcut_index=None, topk_return=0):
+                                shortcut_index=None, topk_return=0,
+                                ref_image_widths=None, ref_image_heights=None):
     """Find the camera in reference views that is closest to the target camera
 
     Args:
@@ -400,7 +416,9 @@ def find_closest_camera_in_view(target_extrinsic, ref_extrinsics, target_intrins
             target_intrinsic_batch, target_extrinsic_batch,
             ref_intrinsics, ref_extrinsics,
             image_width, image_height,
-            near=near, far=far
+            near=near, far=far,
+            cam2_image_width=ref_image_widths,
+            cam2_image_height=ref_image_heights,
         )  # overlap_ratios: [N], angle_betweens: [N]
 
         angle_betweens[angle_betweens < 0] = -angle_betweens[angle_betweens < 0]
@@ -791,12 +809,10 @@ class PanoramaMemoryBank:
         else:
             self.results_path = f"generation_bank_{results_name}"
 
-        # predefine 2d points
-        x = torch.arange(image_width).float()
-        y = torch.arange(image_height).float()
-        points = torch.stack(torch.meshgrid(x, y, indexing='ij'), -1)
-        points = einops.rearrange(points, 'w h c -> (h w) c')
-        self.points = point_padding(points).to(device)
+        # Pixel grids are resolution-specific. Keep a lazy cache so native
+        # panorama slices and smaller generated frames can coexist in one bank.
+        self._points_by_size = {}
+        self.points = self._get_points(image_width, image_height, device=device)
 
         # build panoramic memory bank
         memory_bank_path = f"{root_path}/render_results/pano_bank"
@@ -816,12 +832,22 @@ class PanoramaMemoryBank:
             key = img_path.stem
             view_id, traj_id = img_path.parts[-4], img_path.parts[-3]
             fname = f"{view_id}/{traj_id}/{key}"
+            frame = Image.open(img_p).convert('RGB')
+            source_w, source_h = frame.size
+            depth = load_16bit_png_depth(dep_p)
+            intrinsic = np.array(cam_dict[key]['intrinsic'], dtype=np.float32)
+            if depth.shape[:2] != (source_h, source_w):
+                raise ValueError(
+                    f"Memory image/depth size mismatch for {fname}: "
+                    f"image={source_w}x{source_h}, depth={depth.shape[1]}x{depth.shape[0]}"
+                )
             return (
                 np.array(cam_dict[key]['extrinsic']),
-                np.array(cam_dict[key]['intrinsic']),
-                Image.open(img_p).convert('RGB'),
-                load_16bit_png_depth(dep_p),
-                fname
+                intrinsic,
+                frame,
+                depth,
+                fname,
+                (source_w, source_h),
             )
 
         with ThreadPoolExecutor(max_workers=8) as executor:
@@ -829,9 +855,9 @@ class PanoramaMemoryBank:
             results = list(tqdm(executor.map(_load_item, tasks), total=len(tasks), desc="Loading memory bank...", disable=rank != 0))
 
         if results:
-            self.ref_w2cs, self.ref_Ks, self.ref_frames, self.ref_depths, self.fnames = map(list, zip(*results))
+            self.ref_w2cs, self.ref_Ks, self.ref_frames, self.ref_depths, self.fnames, self.ref_sizes = map(list, zip(*results))
         else:
-            self.ref_w2cs, self.ref_Ks, self.ref_frames, self.ref_depths, self.fnames = [], [], [], [], []
+            self.ref_w2cs, self.ref_Ks, self.ref_frames, self.ref_depths, self.fnames, self.ref_sizes = [], [], [], [], [], []
 
         self.ref_w2cs = torch.from_numpy(np.stack(self.ref_w2cs, axis=0)).to(dtype=torch.float32, device=device)
         self.ref_Ks = torch.from_numpy(np.stack(self.ref_Ks, axis=0)).to(dtype=torch.float32, device=device)
@@ -860,6 +886,75 @@ class PanoramaMemoryBank:
         self.device = device
         self.rank = rank
         self.world_size = world_size
+
+    def _ensure_ref_sizes(self):
+        """Backfill sizes for banks created before heterogeneous-size support."""
+        if not hasattr(self, "ref_sizes"):
+            self.ref_sizes = []
+        if len(self.ref_sizes) < len(self.ref_frames):
+            self.ref_sizes.extend(
+                tuple(frame.size) for frame in self.ref_frames[len(self.ref_sizes):]
+            )
+        elif len(self.ref_sizes) > len(self.ref_frames):
+            self.ref_sizes = self.ref_sizes[:len(self.ref_frames)]
+        return self.ref_sizes
+
+    def _get_points(self, width, height, device=None):
+        width, height = int(width), int(height)
+        key = (width, height)
+        if not hasattr(self, "_points_by_size"):
+            self._points_by_size = {}
+        points = self._points_by_size.get(key)
+        target_device = device if device is not None else self.device
+        if points is None or points.device != torch.device(target_device):
+            x = torch.arange(width, dtype=torch.float32, device=target_device)
+            y = torch.arange(height, dtype=torch.float32, device=target_device)
+            points = torch.stack(torch.meshgrid(x, y, indexing='ij'), -1)
+            points = einops.rearrange(points, 'w h c -> (h w) c')
+            points = point_padding(points)
+            self._points_by_size[key] = points
+        return points
+
+    def resolution_counts(self):
+        self._ensure_ref_sizes()
+        counts = collections.Counter((int(w), int(h)) for w, h in self.ref_sizes)
+        return {f"{w}x{h}": int(count) for (w, h), count in sorted(counts.items())}
+
+    @staticmethod
+    def _frame_array_at_size(frame, target_size):
+        target_size = (int(target_size[0]), int(target_size[1]))
+        if frame.size != target_size:
+            frame = frame.resize(target_size, Image.Resampling.LANCZOS)
+        return np.asarray(frame.convert("RGB"), dtype=np.uint8)[None]
+
+    def _remove_generated_trajectory(self, view_id, traj_id):
+        """Replace, rather than duplicate, a trajectory on cached-node reruns."""
+        if view_id is None or traj_id is None:
+            return 0
+        prefix = f"{view_id}/{traj_id}/"
+        remove_indices = [
+            index for index, fname in enumerate(self.fnames)
+            if index >= self.align_start_index and fname.startswith(prefix)
+        ]
+        if not remove_indices:
+            return 0
+        self._ensure_ref_sizes()
+        old_ref_sizes = self.ref_sizes
+        remove_set = set(remove_indices)
+        keep_indices = [index for index in range(len(self.fnames)) if index not in remove_set]
+        tensor_indices = torch.as_tensor(
+            keep_indices, dtype=torch.long, device=self.ref_w2cs.device
+        )
+        self.ref_w2cs = self.ref_w2cs[tensor_indices]
+        self.ref_Ks = self.ref_Ks[tensor_indices]
+        self.ref_frames = [self.ref_frames[index] for index in keep_indices]
+        self.ref_depths = [self.ref_depths[index] for index in keep_indices]
+        self.fnames = [self.fnames[index] for index in keep_indices]
+        self.ref_sizes = [old_ref_sizes[index] for index in keep_indices]
+        rank0_log(
+            f"Replacing {len(remove_indices)} cached memory frame(s) for {view_id}/{traj_id}."
+        )
+        return len(remove_indices)
 
     def export_pcd(self, save_path, N_points=2_000_000):
         """
@@ -933,10 +1028,25 @@ class PanoramaMemoryBank:
             with open(f"{save_path}/pcd_info.json", "w") as f:
                 json.dump(pcd_info, f)
 
-    def retrieval(self, tar_w2cs_full, tar_Ks_full, view_id=None, traj_id=None):
+    def retrieval(self, tar_w2cs_full, tar_Ks_full, view_id=None, traj_id=None, target_size=None):
         """
-        Return: retrieved_frames, ref_index, ref_index_dict
+        Return temporary, target-sized reference copies without modifying the
+        native-resolution frames or intrinsics stored in the memory bank.
         """
+        self._ensure_ref_sizes()
+        if target_size is None:
+            target_size = (self.image_width, self.image_height)
+        target_width, target_height = int(target_size[0]), int(target_size[1])
+        ref_widths = torch.as_tensor(
+            [size[0] for size in self.ref_sizes],
+            dtype=torch.float32,
+            device=self.ref_Ks.device,
+        )
+        ref_heights = torch.as_tensor(
+            [size[1] for size in self.ref_sizes],
+            dtype=torch.float32,
+            device=self.ref_Ks.device,
+        )
 
         # For certain aerial tracking trajectories, always use part of the previous generation as retrieval results.
         if ("wonder" in view_id or "target" in view_id) and traj_id > "traj0":
@@ -988,13 +1098,15 @@ class PanoramaMemoryBank:
                 self.ref_w2cs,
                 tar_Ks[i],
                 self.ref_Ks,
-                self.image_width,
-                self.image_height,
+                target_width,
+                target_height,
                 method="fov_overlap",
                 near=0.1,
                 far=max(self.depth_median * 8, 0.15),
                 angle_penalty=True,
                 shortcut_index=shortcut_index,
+                ref_image_widths=ref_widths,
+                ref_image_heights=ref_heights,
             )
 
             # Track ref_index when best_idx changes from previous frame
@@ -1002,7 +1114,7 @@ class PanoramaMemoryBank:
                 retrieval_map[best_idx] = i - 1  # key: best_idx, value: the frame index in retrieved_frames corresponding to best_idx, recording only the earliest occurrence.
             ref_index_dict[retrieval_map[best_idx]][i] = {"score": best_score, "angle_diff": angle_diff}  # key: frame index in retrieved_frames, value: target position corresponding to that retrieval frame.
 
-            retrieved_frames.append(np.array(self.ref_frames[best_idx])[None])
+            retrieved_frames.append(self._frame_array_at_size(self.ref_frames[best_idx], target_size))
             retrieved_w2cs.append(self.ref_w2cs[best_idx])
             retrieved_Ks.append(self.ref_Ks[best_idx])
             retrieved_global_indices.append(best_idx)
@@ -1016,6 +1128,12 @@ class PanoramaMemoryBank:
             retrieved_w2cs = retrieved_w2cs[indices]
             retrieved_Ks = retrieved_Ks[indices]
             retrieved_frames_selected = [retrieved_frames[i] for i in indices]
+            selected_indices = torch.as_tensor(indices, dtype=torch.long, device=ref_widths.device)
+            selected_global_indices = torch.as_tensor(
+                retrieved_global_indices, dtype=torch.long, device=ref_widths.device
+            )[selected_indices]
+            retrieved_widths_selected = ref_widths[selected_global_indices]
+            retrieved_heights_selected = ref_heights[selected_global_indices]
             retrieved_frames = []
             retrieved_global_indices_selected = [retrieved_global_indices[i] for i in indices]
             retrieved_global_indices = []
@@ -1030,12 +1148,14 @@ class PanoramaMemoryBank:
                     retrieved_w2cs,
                     tar_Ks[i],
                     retrieved_Ks,
-                    self.image_width,
-                    self.image_height,
+                    target_width,
+                    target_height,
                     method="fov_overlap",
                     near=0.1,
                     far=max(self.depth_median * 8, 0.15),
-                    angle_penalty=True
+                    angle_penalty=True,
+                    ref_image_widths=retrieved_widths_selected,
+                    ref_image_heights=retrieved_heights_selected,
                 )
 
                 # Track ref_index when best_idx changes from previous frame
@@ -1065,6 +1185,8 @@ class PanoramaMemoryBank:
         gen_frames: [PIL.Image] * N
         """
         assert tar_w2cs_full.shape[0] == tar_Ks_full.shape[0] == len(gen_frames)
+        self._ensure_ref_sizes()
+        self._remove_generated_trajectory(view_id, traj_id)
 
         # Downsample frames that need updates in the memory bank, skipping the first frame.
         nframe = len(gen_frames)
@@ -1087,12 +1209,18 @@ class PanoramaMemoryBank:
         self.ref_w2cs = torch.cat([self.ref_w2cs, updated_tar_w2cs.to(self.device)], dim=0)
         self.ref_Ks = torch.cat([self.ref_Ks, updated_tar_Ks.to(self.device)], dim=0)
         self.ref_frames.extend(gen_frames)
+        self.ref_sizes.extend([tuple(frame.size) for frame in gen_frames])
 
         self.ref_depths.extend([None] * len(indices))  # Use None as a placeholder before alignment.
         for index in indices:
             self.fnames.append(f"{view_id}/{traj_id}/{str(index).zfill(4)}")
+        rank0_log(
+            f"Memory bank updated with {len(indices)} frame(s) from {view_id}/{traj_id}; "
+            f"native resolutions={self.resolution_counts()}"
+        )
 
     def apply_worldmirror(self, skip_exist=True):
+        self._ensure_ref_sizes()
         self.world_mirror_dir = f"{self.root_path}/render_results/{self.results_path}/world_mirror_data"
 
         if not (skip_exist and os.path.exists(f"{self.world_mirror_dir}/cameras.json")):
@@ -1107,6 +1235,16 @@ class PanoramaMemoryBank:
             save_tasks = []
             for gi in process_list:
                 fname = self.fnames[gi]
+                source_width, source_height = self.ref_sizes[gi]
+                frame_width, frame_height = int(self.image_width), int(self.image_height)
+                export_frame = self.ref_frames[gi]
+                if export_frame.size != (frame_width, frame_height):
+                    export_frame = export_frame.resize(
+                        (frame_width, frame_height), Image.Resampling.LANCZOS
+                    )
+                export_K = self.ref_Ks[gi].clone()
+                export_K[0, :] *= float(frame_width) / float(max(1, source_width))
+                export_K[1, :] *= float(frame_height) / float(max(1, source_height))
                 view_id, traj_id, frame_id = fname.split("/")
                 if view_id.startswith("render_results"):
                     camera_id = f"pano-{frame_id}"
@@ -1115,13 +1253,17 @@ class PanoramaMemoryBank:
 
                 local_camera_dict["extrinsics"].append({
                     "camera_id": camera_id,
-                    "matrix": self.ref_w2cs[gi].inverse().cpu().numpy().tolist()
+                    "matrix": self.ref_w2cs[gi].inverse().cpu().numpy().tolist(),
+                    "width": int(frame_width),
+                    "height": int(frame_height),
                 })
                 local_camera_dict["intrinsics"].append({
                     "camera_id": camera_id,
-                    "matrix": self.ref_Ks[gi].cpu().numpy().tolist()
+                    "matrix": export_K.cpu().numpy().tolist(),
+                    "width": int(frame_width),
+                    "height": int(frame_height),
                 })
-                save_tasks.append((self.ref_frames[gi], f"{self.world_mirror_dir}/images/{camera_id}.png"))
+                save_tasks.append((export_frame, f"{self.world_mirror_dir}/images/{camera_id}.png"))
 
             # Use multithreading to speed up image saving.
             def _save_image(args):
@@ -1400,6 +1542,7 @@ class PanoramaMemoryBank:
         return float('inf'), {}
 
     def alignment(self, debug_mode=False):
+        self._ensure_ref_sizes()
         # =====================================================================
         # Phase 1: Build the global video mapping and assign videos to different ranks.
         # =====================================================================
@@ -1408,18 +1551,19 @@ class PanoramaMemoryBank:
         global_video_indices_map = dict()
 
         # 1a. Group pano_bank frames into virtual videos by align_nframe.
-        pano_indices = list(range(self.align_start_index))  # All frame indices in pano_bank.
-        n_pano = len(pano_indices)
-        if n_pano > 0:
-            n_splits = max(1, math.ceil(n_pano / self.align_nframe))
-            split_size = math.ceil(n_pano / n_splits)
-            for split_idx in range(n_splits):
-                start = split_idx * split_size
-                end = min(start + split_size, n_pano)
-                group_indices = pano_indices[start:end]
+        pano_by_size = collections.defaultdict(list)
+        for index in range(self.align_start_index):
+            pano_by_size[tuple(self.ref_sizes[index])].append(index)
+        split_idx = 0
+        for _, pano_indices in sorted(pano_by_size.items()):
+            n_splits = max(1, math.ceil(len(pano_indices) / self.align_nframe))
+            split_size = math.ceil(len(pano_indices) / n_splits)
+            for start in range(0, len(pano_indices), split_size):
+                group_indices = pano_indices[start:start + split_size]
                 video_key = f"pano/split_{split_idx}"
                 video_names.append(video_key)
                 global_video_indices_map[video_key] = group_indices
+                split_idx += 1
 
         # 1b. Process normal video frames after align_start_index.
         for i, fname in enumerate(self.fnames):
@@ -1446,6 +1590,12 @@ class PanoramaMemoryBank:
             for idx in global_indices:
                 gen_frames.append(self.ref_frames[idx])
                 gen_tensor.append(transforms.ToTensor()(self.ref_frames[idx]))
+            group_sizes = {tuple(self.ref_sizes[idx]) for idx in global_indices}
+            if len(group_sizes) != 1:
+                raise ValueError(
+                    f"Alignment group {video_name} contains mixed resolutions {sorted(group_sizes)}. "
+                    "Each trajectory must keep a stable output resolution."
+                )
             gen_tensor = torch.stack(gen_tensor, dim=0)  # [f,c,h,w] 0~1
             updated_tar_w2cs = self.ref_w2cs[global_indices]
             updated_tar_Ks = self.ref_Ks[global_indices]
@@ -1512,6 +1662,7 @@ class PanoramaMemoryBank:
             for local_i in range(N_align):
                 gi = global_indices[local_i]
                 fname = self.fnames[gi].split("/")[-1]
+                frame_width, frame_height = self.ref_sizes[gi]
 
                 mono_depth_mask = mono_depths[local_i]["mask"][0]
                 mono_depth = mono_depths[local_i]["depth"][0].clone().detach()
@@ -1535,7 +1686,7 @@ class PanoramaMemoryBank:
                 try:
                     guided_depth, guided_depth_mask, guided_normal = get_guided_depth_infos_v2(w2c=updated_tar_w2cs[local_i], K=updated_tar_Ks[local_i],
                                                                                                prev_points3d=self.global_pcd.vertices, prev_normal=self.global_normal,
-                                                                                               height=self.image_height, width=self.image_width, device=self.device)
+                                                                                               height=frame_height, width=frame_width, device=self.device)
                     guided_depth_np = guided_depth.cpu().numpy()
                     # Compute percentile maps for guided depth and mono depth.
                     guided_mono_mask = (guided_depth_mask & mono_depth_mask).cpu().numpy()
@@ -1595,7 +1746,7 @@ class PanoramaMemoryBank:
                 pred_normal_world = tar_c2w[:3, :3].to(self.device) @ pred_normal_camera.reshape(-1, 3).T
                 pred_normal_world = pred_normal_world.T[:, :3]
                 if guided_normal is not None:
-                    pred_normal = pred_normal_world.reshape(self.image_height, self.image_width, 3)
+                    pred_normal = pred_normal_world.reshape(frame_height, frame_width, 3)
                     normal_angle_diff = compute_normal_angles(guided_normal, pred_normal)
                     normal_mask = (normal_angle_diff <= 90)
                 else:
@@ -1832,6 +1983,7 @@ class PanoramaMemoryBank:
                 fdata = frames[local_i]
                 gi = fdata["gi"]
                 fname = fdata["fname"]
+                frame_width, frame_height = self.ref_sizes[gi]
                 final_k = fdata.get("final_k")
                 final_b = fdata.get("final_b")
 
@@ -1875,7 +2027,7 @@ class PanoramaMemoryBank:
                 rgb_colors = torch.from_numpy(np.array(gen_frames[local_i]).reshape(-1, 3)).to(self.device, dtype=torch.float32)
                 update_points3d, update_rgb = depth2pcd(
                     updated_tar_w2cs[local_i], updated_tar_Ks[local_i],
-                    self.points.clone(), aligned_depth, rgb_colors, update_mask
+                    self._get_points(frame_width, frame_height).clone(), aligned_depth, rgb_colors, update_mask
                 )
                 update_points3d = update_points3d.cpu().numpy()
                 update_rgb = update_rgb.cpu().numpy().astype(np.uint8)
@@ -1891,7 +2043,9 @@ class PanoramaMemoryBank:
                 # Record camera information by directly referencing global ref_Ks/ref_w2cs to avoid redundant storage.
                 video_camera_dicts[video_name][fname] = {
                     "intrinsic": self.ref_Ks[gi].cpu().numpy().tolist(),
-                    "extrinsic": self.ref_w2cs[gi].cpu().numpy().tolist()
+                    "extrinsic": self.ref_w2cs[gi].cpu().numpy().tolist(),
+                    "width": int(frame_width),
+                    "height": int(frame_height),
                 }
 
             n_aligned = len(video_camera_dicts.get(video_name, {}))

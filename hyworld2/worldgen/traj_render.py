@@ -188,7 +188,19 @@ def run_traj_render(args, rank=0, world_size=1, local_rank=0):
             view_id, traj_id = view_dir.name, traj_dir.name
             image_path = view_dir / "start_frame.png"
             splitted_image = Image.open(image_path)
-            image_w, image_h = splitted_image.size
+            source_w, source_h = splitted_image.size
+            image_w = int(camera_info.get("width", source_w) or source_w)
+            image_h = int(camera_info.get("height", source_h) or source_h)
+            if splitted_image.size != (image_w, image_h):
+                # start_frame remains a native-resolution panorama sample on
+                # disk; only the cheap point-render conditioning is resized.
+                splitted_image = splitted_image.resize(
+                    (image_w, image_h), Image.Resampling.LANCZOS
+                )
+                rank0_log(
+                    f"Trajectory render uses {image_w}x{image_h}; native start frame "
+                    f"is preserved at {source_w}x{source_h}."
+                )
 
             Ks = torch.tensor(np.array(camera_info["intrinsic"]), dtype=torch.float32)
             w2cs = torch.tensor(np.array(camera_info["extrinsic"]), dtype=torch.float32)

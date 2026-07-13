@@ -11,6 +11,7 @@ requests
 # Model loading
 huggingface_hub
 safetensors
+llama-cpp-python>=0.3.16
 
 # 3D / PLY
 plyfile

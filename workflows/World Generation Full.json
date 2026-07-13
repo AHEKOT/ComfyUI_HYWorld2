@@ -262,9 +262,10 @@
         false,
         false,
         6,
-        "Qwen3-VL-4B-Instruct",
-        "4-bit (VRAM-friendly)",
+        "<put a .gguf model in ComfyUI/models/llm>",
         768,
+        8192,
+        -1,
         false,
         2
       ]
@@ -501,15 +502,18 @@
         "Node name for S&R": "HYWorld2WorldExpansion"
       },
       "widgets_values": [
-        "Qwen3-VL-4B-Instruct",
-        "4-bit (VRAM-friendly)",
-        "auto",
+        "<put a .gguf model in ComfyUI/models/llm>",
         768,
-        512,
+        192,
         true,
         4,
+        8192,
+        -1,
         1,
         "fixed",
+        0,
+        "",
+        0,
         0
       ]
     },

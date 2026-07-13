@@ -99,7 +99,12 @@ def rename_hyphen_to_underscore(path_list):
     return new_path_list
 
 
-def load_mutli_traj_dataset(cfg, input_path, output_path, view_id, traj_id, device, ref_index=None, model_type=None, task_type="panorama"):
+def load_mutli_traj_dataset(cfg, input_path, output_path, view_id, traj_id, device,
+                            ref_index=None, model_type=None, task_type="panorama",
+                            target_width=0, target_height=0):
+    cam_info = json.load(open(f"{input_path}/{view_id}/{traj_id}/camera.json"))
+    camera_width = int(cam_info.get("width", 0) or 0)
+    camera_height = int(cam_info.get("height", 0) or 0)
     if view_id.startswith("reconstruct_") and traj_id == "traj1":  # iterative traj
         pil_image = get_last_video_frame(f"{output_path}/{view_id}/traj0/{model_type}_result.mp4")
         pil_image = Image.fromarray(pil_image)
@@ -109,16 +114,18 @@ def load_mutli_traj_dataset(cfg, input_path, output_path, view_id, traj_id, devi
         else:
             pil_image = Image.open(f"{input_path}/image.png")
     origin_w, origin_h = pil_image.size
-    # Trajectory generation has already selected the requested output size and
-    # written camera intrinsics for those exact pixels.  Do not run it through
-    # WorldStereo's legacy aspect-ratio scale buckets a second time (for
-    # example, 512x512 used to become 640x640 here).
-    height, width = origin_h, origin_w
+    # Native start frames can be much larger than the inexpensive trajectory
+    # render. Generation has its own explicit resolution; zero keeps the legacy
+    # trajectory camera size without inheriting the native panorama slice size.
+    width = int(target_width) if int(target_width) > 0 else (camera_width or origin_w)
+    height = int(target_height) if int(target_height) > 0 else (camera_height or origin_h)
     if height % 16 != 0 or width % 16 != 0:
         raise ValueError(
             f"Trajectory resolution must be divisible by 16 for WorldStereo, got {width}x{height}. "
             "Regenerate trajectories with a supported width and height."
         )
+    if pil_image.size != (width, height):
+        pil_image = pil_image.resize((width, height), Image.Resampling.LANCZOS)
     meta = {"image": pil_image}
 
     image = transforms.ToTensor()(pil_image) * 2 - 1
@@ -150,11 +157,12 @@ def load_mutli_traj_dataset(cfg, input_path, output_path, view_id, traj_id, devi
         meta["render_mask"] = meta["render_mask"][:, :, indices]
 
     # load camera
-    cam_info = json.load(open(f"{input_path}/{view_id}/{traj_id}/camera.json"))
     w2cs = torch.tensor(np.array(cam_info["extrinsic"]), dtype=torch.float32, device=device)
     intrinsic = torch.tensor(np.array(cam_info["intrinsic"]), dtype=torch.float32, device=device)
-    # width/height intentionally equal the trajectory resolution, so the
-    # stored intrinsics remain in their original pixel coordinate system.
+    source_camera_w = camera_width or origin_w
+    source_camera_h = camera_height or origin_h
+    intrinsic[..., 0, :] *= float(width) / float(max(1, source_camera_w))
+    intrinsic[..., 1, :] *= float(height) / float(max(1, source_camera_h))
 
     if w2cs.shape[0] > cfg.nframe:
         indices = np.linspace(0, w2cs.shape[0] - 1, cfg.nframe, dtype=int)
