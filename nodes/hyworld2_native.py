@@ -2617,6 +2617,11 @@ class HYWorld2TrajectoriesTest(HYWorld2Trajectories):
                                                         "tooltip": "Minimum distance from camera to scene surfaces, as a multiple of median depth."}),
                 "anchor_scan_min_separation": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 10.0, "step": 0.05}),
                 "anchor_scan_yaw_degrees": ("FLOAT", {"default": 360.0, "min": 1.0, "max": 360.0, "step": 1.0}),
+                # Keep restored widgets appended so existing serialized test
+                # nodes retain the value order of every current setting.
+                "additional_nav_traj": ("BOOLEAN", {"default": False}),
+                "extreme_detail_traj": ("BOOLEAN", {"default": False}),
+                "detail_object_limit": ("INT", {"default": 6, "min": 1, "max": 16}),
             },
         }
 
@@ -2664,15 +2669,19 @@ class HYWorld2TrajectoriesTest(HYWorld2Trajectories):
             fov_x=90.0, points_per_pixel=10,
             global_pcd_voxel_size=0.0, apply_anchor_scan=True, anchor_scan_topk=2,
             anchor_scan_min_clearance=0.15, anchor_scan_min_separation=0.75,
-            anchor_scan_yaw_degrees=360.0, **kwargs):
+            anchor_scan_yaw_degrees=360.0, additional_nav_traj=False,
+            extreme_detail_traj=False, detail_object_limit=6, **kwargs):
         from hyworld2.worldgen.src.general_utils import adjust_image_size
         final_h, final_w = adjust_image_size(int(image_height), int(image_width))
         # Preserve square pixels: fy == fx in pixel units. This makes vertical FOV
         # follow the chosen resolution instead of retaining the old 90-degree constant.
         fov_y = np.rad2deg(2.0 * np.arctan(np.tan(np.deg2rad(float(fov_x)) * 0.5) * final_h / final_w))
         return super().run(
-            workspace, seed=seed, scene_type=scene_type, additional_nav_traj=False,
-            extreme_detail_traj=False, apply_nav_traj=False, force_vlm=False, nframe=21,
+            workspace, seed=seed, scene_type=scene_type,
+            additional_nav_traj=bool(additional_nav_traj),
+            extreme_detail_traj=bool(extreme_detail_traj),
+            detail_object_limit=int(detail_object_limit),
+            apply_nav_traj=False, force_vlm=False, nframe=21,
             image_width=image_width, image_height=image_height, fov_x=fov_x, fov_y=fov_y,
             apply_anchor_scan=apply_anchor_scan, anchor_scan_topk=anchor_scan_topk,
             anchor_scan_min_distance=anchor_scan_min_clearance,
@@ -3997,13 +4006,27 @@ class HYWorld2Train3DGS:
                 "normalize_world_space": ("BOOLEAN", {"default": True}),
                 "export_mesh": ("BOOLEAN", {"default": True}),
                 "strategy_refine_start_iter": ("INT", {"default": 150, "min": 0, "max": 100000, "step": 10}),
-                "strategy_refine_stop_iter": ("INT", {"default": 750, "min": 0, "max": 100000, "step": 10}),
+                "strategy_refine_stop_iter": ("INT", {"default": 3500, "min": 0, "max": 100000, "step": 10}),
                 "strategy_refine_every": ("INT", {"default": 100, "min": 1, "max": 100000, "step": 10}),
-                "strategy_refine_scale2d_stop_iter": ("INT", {"default": 750, "min": 0, "max": 100000, "step": 10}),
+                "strategy_refine_scale2d_stop_iter": ("INT", {"default": 3500, "min": 0, "max": 100000, "step": 10}),
                 "strategy_reset_every": ("INT", {"default": 99990, "min": 1, "max": 1000000, "step": 10}),
                 "strategy_grow_grad2d": ("FLOAT", {"default": 0.0001, "min": 0.0, "max": 1.0, "step": 0.00001}),
                 "strategy_prune_scale3d": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 100.0, "step": 0.01}),
                 "convert_ply_to_worldmirror_preview_basis": ("BOOLEAN", {"default": False}),
+                # Keep new widgets appended so existing serialized workflows
+                # retain the value order of all legacy widgets above.
+                "progressive_patch_schedule": ("STRING", {"default": "0:256,1500:384,3500:full"}),
+                "lpips_every": ("INT", {"default": 4, "min": 0, "max": 1000, "step": 1}),
+                "depth_every": ("INT", {"default": 2, "min": 0, "max": 1000, "step": 1}),
+                "normal_every": ("INT", {"default": 4, "min": 0, "max": 1000, "step": 1}),
+                "scale_scheduled_losses": ("BOOLEAN", {"default": True}),
+                "optimizer_mode": (["visible_adam", "fused_adam", "adam", "sparse_adam"], {"default": "visible_adam"}),
+                "progressive_gaussian_budget": ("STRING", {"default": "0:750000,1000:1000000,2000:1400000,3000:2000000"}),
+                "spatial_sort_step": ("INT", {"default": 0, "min": 0, "max": 100000, "step": 100}),
+                "progress_log_every": ("INT", {"default": 25, "min": 1, "max": 1000, "step": 1}),
+                "profile_training": ("BOOLEAN", {"default": True}),
+                "profile_every": ("INT", {"default": 100, "min": 1, "max": 10000, "step": 10}),
+                "mesh_max_gaussians": ("INT", {"default": 4000000, "min": 100000, "max": 50000000, "step": 100000}),
             },
         }
 
@@ -4019,6 +4042,7 @@ class HYWorld2Train3DGS:
         train_sampling_preset="standard",
         batch_size=1,
         patch_size="Full",
+        progressive_patch_schedule="0:256,1500:384,3500:full",
         max_steps=8000,
         save_steps="8000",
         eval_steps="8000",
@@ -4029,6 +4053,10 @@ class HYWorld2Train3DGS:
         disable_viewer=True,
         depth_loss=True,
         normal_loss=True,
+        lpips_every=4,
+        depth_every=2,
+        normal_every=4,
+        scale_scheduled_losses=True,
         sky_depth_from_pcd=True,
         use_scale_regularization=True,
         use_mask_gaussian=True,
@@ -4038,12 +4066,19 @@ class HYWorld2Train3DGS:
         do_prune=False,
         prune_opacity_threshold=0.01,
         antialiased=True,
+        optimizer_mode="visible_adam",
+        progressive_gaussian_budget="0:750000,1000:1000000,2000:1400000,3000:2000000",
+        spatial_sort_step=0,
+        progress_log_every=25,
+        profile_training=True,
+        profile_every=100,
+        mesh_max_gaussians=4000000,
         normalize_world_space=True,
         export_mesh=True,
         strategy_refine_start_iter=150,
-        strategy_refine_stop_iter=750,
+        strategy_refine_stop_iter=3500,
         strategy_refine_every=100,
-        strategy_refine_scale2d_stop_iter=750,
+        strategy_refine_scale2d_stop_iter=3500,
         strategy_reset_every=99990,
         strategy_grow_grad2d=0.0001,
         strategy_prune_scale3d=0.1,
@@ -4052,7 +4087,6 @@ class HYWorld2Train3DGS:
         _hy_log("Train 3DGS", "Stage 1/5: preparing trainer config")
         _ensure_worldgen_path()
         import hyworld2.worldgen.world_gs_trainer as trainer
-        from gsplat.strategy import DefaultStrategy
 
         data_dir = Path(gs_data["gs_data_dir"])
         out_dir = data_dir.parent / "gs_results"
@@ -4060,10 +4094,29 @@ class HYWorld2Train3DGS:
         _hy_log("Train 3DGS", f"Output train_dir: {out_dir}")
         _reset_dir(out_dir, "HYWorld2 train_dir")
         _ensure_scene_type_meta(data_dir)
-        strategy = DefaultStrategy(
+        progressive_gaussian_budget = str(progressive_gaussian_budget or "").strip()
+        effective_refine_stop_iter = int(strategy_refine_stop_iter)
+        if progressive_gaussian_budget:
+            try:
+                last_budget_step = max(
+                    int(entry.strip().split(":", 1)[0])
+                    for entry in progressive_gaussian_budget.split(",")
+                    if entry.strip()
+                )
+                # Old serialized workflows retain the former default (750).
+                # Keep ADC alive long enough to reach the appended progressive
+                # budget stages without requiring users to recreate the node.
+                effective_refine_stop_iter = max(
+                    effective_refine_stop_iter,
+                    last_budget_step + max(500, int(strategy_refine_every)),
+                )
+            except (ValueError, IndexError):
+                # The trainer's strict parser will provide the actionable error.
+                pass
+        strategy = trainer.BudgetedDefaultStrategy(
             verbose=True,
             refine_start_iter=int(strategy_refine_start_iter),
-            refine_stop_iter=int(strategy_refine_stop_iter),
+            refine_stop_iter=effective_refine_stop_iter,
             refine_every=int(strategy_refine_every),
             refine_scale2d_stop_iter=int(strategy_refine_scale2d_stop_iter),
             reset_every=int(strategy_reset_every),
@@ -4075,6 +4128,7 @@ class HYWorld2Train3DGS:
         cfg.result_dir = str(out_dir)
         cfg.batch_size = int(batch_size)
         cfg.patch_size = None if str(patch_size) == "Full" else int(patch_size)
+        cfg.progressive_patch_schedule = str(progressive_patch_schedule or "").strip()
         if hasattr(cfg, "train_sampling_preset"):
             cfg.train_sampling_preset = str(train_sampling_preset)
         cfg.max_steps = int(max_steps)
@@ -4091,6 +4145,10 @@ class HYWorld2Train3DGS:
         normal_files_valid = _has_valid_normal_files(data_dir)
         cfg.depth_loss = bool(depth_loss and depth_files_valid)
         cfg.normal_loss = bool(normal_loss and normal_files_valid)
+        cfg.lpips_every = max(0, int(lpips_every))
+        cfg.depth_every = max(0, int(depth_every))
+        cfg.normal_every = max(0, int(normal_every))
+        cfg.scale_scheduled_losses = bool(scale_scheduled_losses)
         cfg.sky_depth_from_pcd = bool(sky_depth_from_pcd and cfg.depth_loss and normal_files_valid)
         cfg.use_scale_regularization = bool(use_scale_regularization)
         cfg.use_mask_gaussian = bool(use_mask_gaussian)
@@ -4103,6 +4161,17 @@ class HYWorld2Train3DGS:
         cfg.do_prune = bool(do_prune)
         cfg.prune_opacity_threshold = float(prune_opacity_threshold)
         cfg.antialiased = bool(antialiased)
+        optimizer_mode = str(optimizer_mode)
+        cfg.visible_adam = optimizer_mode == "visible_adam"
+        cfg.fused_adam = optimizer_mode == "fused_adam"
+        cfg.sparse_grad = optimizer_mode == "sparse_adam"
+        cfg.packed = cfg.sparse_grad
+        cfg.progressive_gaussian_budget = progressive_gaussian_budget
+        cfg.spatial_sort_step = max(0, int(spatial_sort_step))
+        cfg.progress_log_every = max(1, int(progress_log_every))
+        cfg.profile_training = bool(profile_training)
+        cfg.profile_every = max(1, int(profile_every))
+        cfg.mesh_max_gaussians = max(100000, int(mesh_max_gaussians))
         cfg.no_normalize = not bool(normalize_world_space)
         if hasattr(cfg, "export_mesh"):
             cfg.export_mesh = bool(export_mesh)
@@ -4113,6 +4182,8 @@ class HYWorld2Train3DGS:
             f"train_sampling_preset={getattr(cfg, 'train_sampling_preset', 'standard')}, "
             f"max_steps={cfg.max_steps}, downsample_pts_num={cfg.downsample_pts_num}, save_ply={cfg.save_ply}, "
             f"depth_loss={cfg.depth_loss}, normal_loss={cfg.normal_loss}, sky_depth_from_pcd={cfg.sky_depth_from_pcd}, "
+            f"loss_every={cfg.lpips_every}/{cfg.depth_every}/{cfg.normal_every}, optimizer_mode={optimizer_mode}, "
+            f"progressive_patch={cfg.progressive_patch_schedule or 'off'}, progressive_budget={cfg.progressive_gaussian_budget or 'off'}, "
             f"use_scale_regularization={cfg.use_scale_regularization}, use_mask_gaussian={cfg.use_mask_gaussian}, "
             f"use_anchor_protection={getattr(cfg, 'use_anchor_protection', False)}, "
             f"antialiased={cfg.antialiased}, normalize_world_space={bool(normalize_world_space)}"
@@ -4122,6 +4193,7 @@ class HYWorld2Train3DGS:
             "result_dir": str(out_dir),
             "batch_size": int(cfg.batch_size),
             "patch_size": cfg.patch_size,
+            "progressive_patch_schedule": cfg.progressive_patch_schedule,
             "train_sampling_preset": str(getattr(cfg, "train_sampling_preset", "standard")),
             "max_steps": int(max_steps),
             "save_steps": cfg.save_steps,
@@ -4136,6 +4208,10 @@ class HYWorld2Train3DGS:
             "depth_loss_enabled": bool(cfg.depth_loss),
             "normal_loss_requested": bool(normal_loss),
             "normal_loss_enabled": bool(cfg.normal_loss),
+            "lpips_every": int(cfg.lpips_every),
+            "depth_every": int(cfg.depth_every),
+            "normal_every": int(cfg.normal_every),
+            "scale_scheduled_losses": bool(cfg.scale_scheduled_losses),
             "sky_depth_from_pcd_requested": bool(sky_depth_from_pcd),
             "sky_depth_from_pcd_enabled": bool(cfg.sky_depth_from_pcd),
             "use_scale_regularization": bool(cfg.use_scale_regularization),
@@ -4146,6 +4222,17 @@ class HYWorld2Train3DGS:
             "do_prune": bool(cfg.do_prune),
             "prune_opacity_threshold": float(cfg.prune_opacity_threshold),
             "antialiased": bool(cfg.antialiased),
+            "optimizer_mode": optimizer_mode,
+            "visible_adam": bool(cfg.visible_adam),
+            "fused_adam": bool(cfg.fused_adam),
+            "packed": bool(cfg.packed),
+            "sparse_grad": bool(cfg.sparse_grad),
+            "progressive_gaussian_budget": cfg.progressive_gaussian_budget,
+            "spatial_sort_step": int(cfg.spatial_sort_step),
+            "progress_log_every": int(cfg.progress_log_every),
+            "profile_training": bool(cfg.profile_training),
+            "profile_every": int(cfg.profile_every),
+            "mesh_max_gaussians": int(cfg.mesh_max_gaussians),
             "normalize_world_space": bool(normalize_world_space),
             "export_mesh": bool(getattr(cfg, "export_mesh", False)),
             "strategy": {

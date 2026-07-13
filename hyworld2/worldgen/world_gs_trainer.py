@@ -1,4 +1,5 @@
 import json
+import gc
 import math
 import os
 import sys
@@ -25,6 +26,7 @@ from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
+from gsplat.strategy.ops import duplicate as gsplat_duplicate, split as gsplat_split
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -41,6 +43,93 @@ from gs.traj import (
     generate_interpolated_path,
     generate_spiral_path,
 )
+
+
+@dataclass
+class BudgetedDefaultStrategy(DefaultStrategy):
+    """Default gsplat ADC with a runtime-controlled hard growth budget.
+
+    This lives in the trainer instead of only in the vendored gsplat source so
+    an already-installed site-packages copy cannot silently bypass the budget.
+    """
+
+    @torch.no_grad()
+    def _grow_gs(self, params, optimizers, state, step):
+        count = state["count"]
+        grads = state["grad2d"] / count.clamp_min(1)
+        device = grads.device
+
+        is_grad_high = grads > self.grow_grad2d
+        is_small = (
+            torch.exp(params["scales"]).max(dim=-1).values
+            <= self.grow_scale3d * state["scene_scale"]
+        )
+        is_dupli = is_grad_high & is_small
+        is_split = is_grad_high & ~is_small
+        if step < self.refine_scale2d_stop_iter:
+            is_split |= state["radii"] > self.grow_scale2d
+
+        if state.get("anchor_no_densify", False) and state.get("is_anchor") is not None:
+            is_dupli &= ~state["is_anchor"]
+            is_split &= ~state["is_anchor"]
+        if state.get("align_no_densify", False) and state.get("is_align") is not None:
+            is_dupli &= ~state["is_align"]
+            is_split &= ~state["is_align"]
+
+        max_gaussians = int(state.get("max_gaussians", 0) or 0)
+        available = max(0, max_gaussians - len(params["means"])) if max_gaussians > 0 else None
+        dupli_ids = torch.where(is_dupli)[0]
+        split_ids = torch.where(is_split)[0]
+        candidate_ids = torch.cat([dupli_ids, split_ids])
+        n_candidates = len(candidate_ids)
+
+        if available is not None and n_candidates > available:
+            selected_dupli = torch.zeros_like(is_dupli)
+            selected_split = torch.zeros_like(is_split)
+            if available > 0:
+                top_local = torch.topk(
+                    grads[candidate_ids], k=available, largest=True, sorted=False
+                ).indices
+                selected_ops = torch.zeros(n_candidates, dtype=torch.bool, device=device)
+                selected_ops[top_local] = True
+                n_dupli_candidates = len(dupli_ids)
+                selected_dupli[dupli_ids[selected_ops[:n_dupli_candidates]]] = True
+                selected_split[split_ids[selected_ops[n_dupli_candidates:]]] = True
+            is_dupli &= selected_dupli
+            is_split &= selected_split
+            if self.verbose:
+                print(
+                    f"[Progressive GS Budget] step={step} budget={max_gaussians} "
+                    f"current={len(params['means'])} candidates={n_candidates} "
+                    f"selected={int(is_dupli.sum().item() + is_split.sum().item())}."
+                )
+
+        n_dupli = int(is_dupli.sum().item())
+        n_split = int(is_split.sum().item())
+        if n_dupli > 0:
+            gsplat_duplicate(params=params, optimizers=optimizers, state=state, mask=is_dupli)
+            if state.get("is_anchor") is not None:
+                state["is_anchor"][-n_dupli:] = False
+            if state.get("is_align") is not None:
+                state["is_align"][-n_dupli:] = False
+
+        is_split = torch.cat([
+            is_split,
+            torch.zeros(n_dupli, dtype=torch.bool, device=device),
+        ])
+        if n_split > 0:
+            gsplat_split(
+                params=params,
+                optimizers=optimizers,
+                state=state,
+                mask=is_split,
+                revised_opacity=self.revised_opacity,
+            )
+            if state.get("is_anchor") is not None:
+                state["is_anchor"][-2 * n_split:] = False
+            if state.get("is_align") is not None:
+                state["is_align"][-2 * n_split:] = False
+        return n_dupli, n_split
 
 
 @dataclass
@@ -84,6 +173,8 @@ class Config:
     train_sampling_preset: Literal["standard", "half_pano_per_epoch", "random_pano_50_per_epoch"] = "standard"
     # Random crop size for training  (experimental)
     patch_size: Optional[int] = None
+    # Step-based crop schedule, e.g. "0:256,1500:384,3500:full".
+    progressive_patch_schedule: str = ""
     # A global scaler that applies to the scene size related parameters
     global_scale: float = 1.0
     # Normalize the world space
@@ -138,6 +229,12 @@ class Config:
     ssim_lambda: float = 0.2
     lpips_lambda1: float = 0.2
     lpips_lambda2: float = 0.1
+    # Expensive auxiliary losses may be evaluated less frequently. Their
+    # weights are multiplied by the interval to preserve expected strength.
+    lpips_every: int = 1
+    depth_every: int = 1
+    normal_every: int = 1
+    scale_scheduled_losses: bool = True
 
     preload_gs_path: str = None
 
@@ -162,12 +259,25 @@ class Config:
     sparse_grad: bool = False
     # Use visible adam from Taming 3DGS. (experimental)
     visible_adam: bool = False
+    # Use PyTorch's fused CUDA Adam when visible/sparse Adam are disabled.
+    fused_adam: bool = False
     # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
     antialiased: bool = False
     apply_mask: bool = False
 
     # Use random background for training to discourage transparency
     random_bkgd: bool = False
+
+    # Progressive ADC budget, e.g.
+    # "0:750000,1000:1000000,2000:1400000,3000:2000000".
+    progressive_gaussian_budget: str = ""
+    # Optional one-shot Morton ordering after densification. Disabled by
+    # default because it can regress pixel-parallel backward implementations.
+    spatial_sort_step: int = 0
+    # Reduce progress-bar synchronizations and periodically profile GPU stages.
+    progress_log_every: int = 25
+    profile_training: bool = False
+    profile_every: int = 100
 
     # background colors
     background_color: str = None
@@ -272,6 +382,9 @@ class Config:
 
     # mesh params
     export_mesh: bool = False
+    # Skip optional mesh extraction rather than OOM if a user disables the
+    # progressive budget and produces an unexpectedly huge scene.
+    mesh_max_gaussians: int = 4_000_000
     voxel_size: float = 0.05  # Fine: 0.01, coarse: 0.05.
     sdf_trunc: float = 0.3  # Usually 4x the voxel size.
     downsample_perc: float = 0.1
@@ -383,6 +496,7 @@ def create_splats_with_optimizers(
         sh_degree: int = 3,
         sparse_grad: bool = False,
         visible_adam: bool = False,
+        fused_adam: bool = False,
         batch_size: int = 1,
         feature_dim: Optional[int] = None,
         device: str = "cuda",
@@ -483,15 +597,19 @@ def create_splats_with_optimizers(
         optimizer_class = SelectiveAdam
     else:
         optimizer_class = torch.optim.Adam
-    optimizers = {
-        name: optimizer_class(
-            [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
-            eps=1e-15 / math.sqrt(BS),
+    optimizers = {}
+    for name, _, lr in params:
+        optimizer_kwargs = {
+            "eps": 1e-15 / math.sqrt(BS),
             # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
-            betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+            "betas": (1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+        }
+        if optimizer_class is torch.optim.Adam and fused_adam:
+            optimizer_kwargs["fused"] = True
+        optimizers[name] = optimizer_class(
+            [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
+            **optimizer_kwargs,
         )
-        for name, _, lr in params
-    }
     return splats, optimizers
 
 
@@ -568,6 +686,154 @@ def compute_mask_prune_mask(
         "alive_count": alive_count,
     }
     return prune_mask, stats
+
+
+def _parse_step_schedule(spec: str, value_parser) -> List[Tuple[int, object]]:
+    """Parse ``step:value`` entries while keeping UI strings human-editable."""
+    result = []
+    for raw_entry in str(spec or "").split(","):
+        entry = raw_entry.strip()
+        if not entry:
+            continue
+        if ":" not in entry:
+            raise ValueError(f"Invalid schedule entry {entry!r}; expected step:value")
+        raw_step, raw_value = entry.split(":", 1)
+        step = int(raw_step.strip())
+        if step < 0:
+            raise ValueError(f"Schedule step must be >= 0, got {step}")
+        result.append((step, value_parser(raw_value.strip())))
+    result.sort(key=lambda item: item[0])
+    return result
+
+
+def _scheduled_value(schedule: List[Tuple[int, object]], step: int, default):
+    value = default
+    for start_step, scheduled in schedule:
+        if step < start_step:
+            break
+        value = scheduled
+    return value
+
+
+@torch.no_grad()
+def _enforce_gaussian_budget(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, object],
+    budget: int,
+    step: int,
+    phase: str,
+) -> int:
+    """Hard fallback cap independent of the densification strategy implementation."""
+    current = len(params["means"])
+    if budget <= 0 or current <= budget:
+        return 0
+
+    protected = torch.zeros(current, dtype=torch.bool, device=params["means"].device)
+    for key in ("is_anchor", "is_align"):
+        value = state.get(key)
+        if isinstance(value, torch.Tensor) and value.shape == protected.shape:
+            protected |= value
+    protected_count = int(protected.sum().item())
+    if protected_count > budget:
+        raise RuntimeError(
+            f"Gaussian budget {budget} is smaller than {protected_count} protected "
+            f"anchor/alignment Gaussians at step {step}."
+        )
+
+    keep = protected.clone()
+    remaining = budget - protected_count
+    candidates = torch.where(~protected)[0]
+    if remaining > 0:
+        # Opacity is a stable fallback importance measure. This path should only
+        # execute if a strategy implementation violates the primary growth cap.
+        scores = torch.sigmoid(params["opacities"].detach().flatten()[candidates])
+        selected = torch.topk(scores, k=remaining, largest=True, sorted=False).indices
+        keep[candidates[selected]] = True
+    remove_mask = ~keep
+    removed = int(remove_mask.sum().item())
+    from gsplat.strategy.ops import remove as gsplat_remove
+
+    gsplat_remove(
+        params=params,
+        optimizers=optimizers,
+        state=state,
+        mask=remove_mask,
+    )
+    print(
+        f"[Progressive GS Budget HARD CAP] step={step} phase={phase} "
+        f"budget={budget} before={current} removed={removed} "
+        f"after={len(params['means'])}."
+    )
+    return removed
+
+
+def _parse_patch_value(value: str) -> Optional[int]:
+    if value.lower() in {"full", "none", "off", "0"}:
+        return None
+    patch = int(value)
+    if patch < 16:
+        raise ValueError(f"Training patch must be >= 16, got {patch}")
+    return patch
+
+
+def _morton_order(means: Tensor) -> Tensor:
+    """Return a 10-bit-per-axis Morton ordering for Gaussian centers."""
+    mins = means.amin(dim=0)
+    spans = (means.amax(dim=0) - mins).clamp_min(1e-8)
+    xyz = (((means - mins) / spans) * 1023.0).clamp(0, 1023).to(torch.int64)
+
+    def expand_bits(values: Tensor) -> Tensor:
+        values = (values | (values << 16)) & 0x030000FF
+        values = (values | (values << 8)) & 0x0300F00F
+        values = (values | (values << 4)) & 0x030C30C3
+        values = (values | (values << 2)) & 0x09249249
+        return values
+
+    codes = expand_bits(xyz[:, 0]) | (expand_bits(xyz[:, 1]) << 1) | (expand_bits(xyz[:, 2]) << 2)
+    return torch.argsort(codes)
+
+
+@torch.no_grad()
+def _reorder_gaussians(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, Tensor],
+    order: Tensor,
+):
+    """Apply one ordering to splats, optimizer moments, and per-splat state."""
+    n_gaussians = len(order)
+    for name in list(params.keys()):
+        param = params[name]
+        new_param = torch.nn.Parameter(
+            param[order], requires_grad=param.requires_grad
+        )
+        params[name] = new_param
+        if name not in optimizers:
+            if param.requires_grad:
+                raise RuntimeError(f"Missing optimizer for trainable Gaussian parameter {name!r}")
+            continue
+        optimizer = optimizers[name]
+        param_state = optimizer.state.pop(param, {})
+        for key, value in list(param_state.items()):
+            if (
+                key != "step"
+                and isinstance(value, torch.Tensor)
+                and value.ndim > 0
+                and value.shape[0] == n_gaussians
+            ):
+                param_state[key] = value[order]
+        for group in optimizer.param_groups:
+            group["params"] = [new_param if item is param else item for item in group["params"]]
+        optimizer.state[new_param] = param_state
+
+    for key, value in list(state.items()):
+        if (
+            isinstance(value, torch.Tensor)
+            and value.ndim > 0
+            and value.shape[0] == n_gaussians
+        ):
+            state[key] = value[order]
 
 
 def compute_camera_obb(
@@ -708,6 +974,7 @@ class Runner:
             sh_degree=cfg.sh_degree,
             sparse_grad=cfg.sparse_grad,
             visible_adam=cfg.visible_adam,
+            fused_adam=cfg.fused_adam,
             batch_size=cfg.batch_size,
             feature_dim=feature_dim,
             device=self.device,
@@ -848,7 +1115,10 @@ class Runner:
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
         self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
 
-        if cfg.lpips_net == "alex":
+        self.lpips = None
+        if cfg.lpips_lambda1 <= 0 and cfg.lpips_lambda2 <= 0:
+            pass
+        elif cfg.lpips_net == "alex":
             self.lpips = LearnedPerceptualImagePatchSimilarity(
                 net_type="alex", normalize=True
             ).to(self.device)
@@ -1021,12 +1291,40 @@ class Runner:
                 )
             )
 
+        patch_schedule = _parse_step_schedule(
+            cfg.progressive_patch_schedule, _parse_patch_value
+        )
+        budget_schedule = _parse_step_schedule(
+            cfg.progressive_gaussian_budget, lambda value: max(0, int(value))
+        )
+        loader_workers = cfg.dataloader_num_workers
+        if patch_schedule and loader_workers > 0:
+            # Dataset worker copies would not observe the step-based patch size.
+            print("[HYWorld2 Train 3DGS] Progressive patch schedule forces dataloader_num_workers=0.")
+            loader_workers = 0
+        if self.world_rank == 0:
+            grow_impl = getattr(type(cfg.strategy), "_grow_gs", None)
+            grow_impl_name = (
+                f"{getattr(grow_impl, '__module__', '?')}."
+                f"{getattr(grow_impl, '__qualname__', '?')}"
+                if grow_impl is not None
+                else "none"
+            )
+            print(
+                "[HYWorld2 Train 3DGS] Acceleration: "
+                f"visible_adam={cfg.visible_adam}, fused_adam={cfg.fused_adam}, "
+                f"packed={cfg.packed}, sparse_grad={cfg.sparse_grad}, "
+                f"loss_every(lpips/depth/normal)={cfg.lpips_every}/{cfg.depth_every}/{cfg.normal_every}, "
+                f"patch_schedule={patch_schedule or 'off'}, budget_schedule={budget_schedule or 'off'}, "
+                f"strategy={type(cfg.strategy).__name__}, grow_impl={grow_impl_name}"
+            )
+
         trainloader = torch.utils.data.DataLoader(
             self.trainset,
             batch_size=cfg.batch_size,
             shuffle=True,
-            num_workers=cfg.dataloader_num_workers,
-            persistent_workers=cfg.dataloader_num_workers > 0,
+            num_workers=loader_workers,
+            persistent_workers=loader_workers > 0,
             pin_memory=True,
         )
         trainloader_iter = iter(trainloader)
@@ -1037,13 +1335,57 @@ class Runner:
         ply_steps = {i - 1 for i in cfg.ply_steps}
         eval_steps = {i - 1 for i in cfg.eval_steps}
         pbar = tqdm.tqdm(range(init_step, max_steps))
+        last_budget = None
         for step in pbar:
+            step_wall_start = time.perf_counter()
+            profile_this_step = bool(
+                cfg.profile_training
+                and cfg.profile_every > 0
+                and (step + 1) % cfg.profile_every == 0
+            )
+            profile_events = {}
+
+            def _profile_mark(name: str):
+                if profile_this_step:
+                    event = torch.cuda.Event(enable_timing=True)
+                    event.record()
+                    profile_events[name] = event
+
             loss_decay = (max_steps - step) / max_steps
             if not cfg.disable_viewer:
                 while self.viewer.state == "paused":
                     time.sleep(0.01)
                 self.viewer.lock.acquire()
                 tic = time.time()
+
+            scheduled_patch = _scheduled_value(patch_schedule, step, cfg.patch_size)
+            if self.trainset.patch_size != scheduled_patch:
+                self.trainset.patch_size = scheduled_patch
+                if self.world_rank == 0:
+                    print(
+                        f"[Progressive Patch] step={step} patch="
+                        f"{scheduled_patch if scheduled_patch is not None else 'full'}"
+                    )
+
+            scheduled_budget = int(
+                _scheduled_value(budget_schedule, step, 0) or 0
+            )
+            self.strategy_state["max_gaussians"] = scheduled_budget
+            if scheduled_budget != last_budget:
+                last_budget = scheduled_budget
+                if self.world_rank == 0 and budget_schedule:
+                    print(
+                        f"[Progressive GS Budget] step={step} budget="
+                        f"{scheduled_budget if scheduled_budget > 0 else 'unlimited'}"
+                    )
+            _enforce_gaussian_budget(
+                params=self.splats,
+                optimizers=self.optimizers,
+                state=self.strategy_state,
+                budget=scheduled_budget,
+                step=step,
+                phase="pre_forward",
+            )
 
             try:
                 data = next(trainloader_iter)
@@ -1061,10 +1403,24 @@ class Runner:
             )
             image_ids = data["image_id"].to(device)
             masks = data["mask"].to(device) if cfg.apply_mask and "mask" in data else None  # [1, H, W]
+            data_wall_ms = (time.perf_counter() - step_wall_start) * 1000.0
+            _profile_mark("ready")
+
+            run_lpips = bool(
+                cfg.lpips_lambda1 > 0
+                and cfg.lpips_every > 0
+                and step % cfg.lpips_every == 0
+            )
+            run_depth_loss = bool(
+                cfg.depth_loss and cfg.depth_every > 0 and step % cfg.depth_every == 0
+            )
+            run_normal_loss = bool(
+                cfg.normal_loss and cfg.normal_every > 0 and step % cfg.normal_every == 0
+            )
 
             opt_depth = False
             original_depth_mask = None
-            if cfg.depth_loss:
+            if run_depth_loss:
                 depths_gt = data["depths"].to(device)  # [1, M]
                 if depths_gt.sum() > 0:
                     opt_depth = True
@@ -1104,7 +1460,7 @@ class Runner:
                 depths_gt = None
 
             opt_normal = False
-            if cfg.normal_loss:
+            if run_normal_loss:
                 normals_gt = data["normals"].to(device)  # [1, M, 3]
                 if normals_gt.abs().sum() > 0:
                     normal_mask_gt = ((normals_gt ** 2).sum(dim=1) > 0.1)
@@ -1154,6 +1510,7 @@ class Runner:
                 mask_gate=cur_mask_gate,
                 distloss=cfg.dist_loss,
             )
+            _profile_mark("forward")
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
             else:
@@ -1216,7 +1573,7 @@ class Runner:
             )
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
 
-            if cfg.lpips_lambda1 > 0:
+            if run_lpips:
                 pixels_p = torch.clip(pixels.permute(0, 3, 1, 2), 0, 1)  # [1, 3, H, W]
                 colors_p = torch.clip(colors.permute(0, 3, 1, 2), 0, 1)  # [1, 3, H, W]
                 lpipsloss = self.lpips(colors_p, pixels_p)
@@ -1224,7 +1581,8 @@ class Runner:
                     lpips_weight = cfg.lpips_lambda2 + loss_decay * (cfg.lpips_lambda1 - cfg.lpips_lambda2)
                 else:
                     lpips_weight = cfg.lpips_lambda1
-                loss = loss + lpips_weight * lpipsloss
+                lpips_scale = cfg.lpips_every if cfg.scale_scheduled_losses else 1
+                loss = loss + lpips_weight * lpipsloss * lpips_scale
             else:
                 lpipsloss = torch.tensor(0.0).to(self.device)
 
@@ -1254,7 +1612,8 @@ class Runner:
                 else:
                     depthloss = torch.tensor(0.0, dtype=torch.float32, device=device)
                 depth_loss_weight = cfg.depth_lambda2 + loss_decay * (cfg.depth_lambda1 - cfg.depth_lambda2)
-                loss += depthloss * depth_loss_weight
+                depth_scale = cfg.depth_every if cfg.scale_scheduled_losses else 1
+                loss += depthloss * depth_loss_weight * depth_scale
             else:
                 depthloss = torch.tensor(0.0, dtype=torch.float32, device=device)
 
@@ -1287,7 +1646,8 @@ class Runner:
                 valid_mask = normals_pred_mask.squeeze(1) & normal_mask_gt  # [B, H, W]
                 normalloss = (1 - dot[valid_mask]).mean() if valid_mask.any() else torch.tensor(0.0, device=dot.device)
                 normal_loss_weight = cfg.normal_lambda2 + loss_decay * (cfg.normal_lambda1 - cfg.normal_lambda2)
-                loss += normalloss * normal_loss_weight
+                normal_scale = cfg.normal_every if cfg.scale_scheduled_losses else 1
+                loss += normalloss * normal_loss_weight * normal_scale
             else:
                 normalloss = torch.tensor(0.0, dtype=torch.float32, device=device)
 
@@ -1347,27 +1707,34 @@ class Runner:
                 lambda_mask = cfg.mask_lambda if (cfg.mask_from_iter <= step <= cfg.mask_until_iter) else 0.0
                 loss = loss + lambda_mask * mask_loss_val
 
+            _profile_mark("losses")
             loss.backward()
+            _profile_mark("backward")
 
-            desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
-            if cfg.depth_loss:
-                desc += f"depth={depthloss.item():.3f}| "
-            if cfg.normal_loss:
-                desc += f"normal={normalloss.item():.3f}| "
-            if cfg.sky_depth_smooth:
-                desc += f"sky={sky_depth_loss.item():.3f}| "
-            if cfg.dist_loss:
-                desc += f"dist_loss={dist_loss_val.item():.3f}| "
-            if cfg.pose_opt and cfg.pose_noise:
-                # monitor the pose error if we inject noise
-                pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
-                desc += f"pose_err={pose_err.item():.4f}| "
-            if cfg.use_mask_gaussian and "mask_score" in self.splats:
-                with torch.no_grad():
-                    _mp = torch.softmax(self.splats["mask_score"], dim=-1)[:, 0]
-                    _n_active = int((_mp > 0.5).sum().item())
-                desc += f"act_mask={_n_active}/{len(_mp)}| "
-            pbar.set_description(desc)
+            should_log_progress = bool(
+                step == max_steps - 1
+                or cfg.progress_log_every <= 1
+                or step % cfg.progress_log_every == 0
+            )
+            if should_log_progress:
+                desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+                if run_depth_loss:
+                    desc += f"depth={depthloss.item():.3f}| "
+                if run_normal_loss:
+                    desc += f"normal={normalloss.item():.3f}| "
+                if cfg.sky_depth_smooth:
+                    desc += f"sky={sky_depth_loss.item():.3f}| "
+                if cfg.dist_loss:
+                    desc += f"dist_loss={dist_loss_val.item():.3f}| "
+                if cfg.pose_opt and cfg.pose_noise:
+                    pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
+                    desc += f"pose_err={pose_err.item():.4f}| "
+                if cfg.use_mask_gaussian and "mask_score" in self.splats:
+                    with torch.no_grad():
+                        _mp = torch.softmax(self.splats["mask_score"], dim=-1)[:, 0]
+                        _n_active = int((_mp > 0.5).sum().item())
+                    desc += f"act_mask={_n_active}/{len(_mp)}| "
+                pbar.set_description(desc)
 
             if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
                 mem = torch.cuda.max_memory_allocated() / 1024 ** 3
@@ -1398,7 +1765,6 @@ class Runner:
                     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
                     canvas = canvas.reshape(-1, *canvas.shape[2:])
                     self.writer.add_image("train/render", canvas, step)
-                self.writer.flush()
 
             # save checkpoint before updating the model
             if step in save_steps or step == max_steps - 1:
@@ -1703,8 +2069,27 @@ class Runner:
                         except:
                             print("Failed to convert to spx, please install gsbox at first.")
 
+                # Export filtering can materialize a second full set of GPU
+                # tensors. They are no longer needed after PLY/SPZ metadata is
+                # written, so release them before optional full-scene renders.
+                means = scales = quats = opacities = sh0 = shN = None
+                mask_prob = export_quats = None
+                gc.collect()
+                torch.cuda.empty_cache()
+
+                mesh_allowed = bool(
+                    cfg.export_mesh
+                    and len(self.splats["means"]) <= cfg.mesh_max_gaussians
+                )
+                if cfg.export_mesh and not mesh_allowed and self.world_rank == 0:
+                    print(
+                        f"[WARNING] Skipping mesh extraction: {len(self.splats['means'])} "
+                        f"Gaussians exceed mesh_max_gaussians={cfg.mesh_max_gaussians}. "
+                        "The trained PLY has already been saved."
+                    )
+
                 # training over, saving mesh
-                if cfg.export_mesh:
+                if mesh_allowed:
                     import open3d as o3d
                     from gs.extract_mesh import estimate_bounding_sphere, extract_mesh_bounded, post_process_mesh
                     if self.world_rank == 0:
@@ -1745,7 +2130,7 @@ class Runner:
                     if self.world_rank == 0:
                         # ---- Estimate bounding sphere ----
                         center, radius = estimate_bounding_sphere(
-                            means, camtoworlds_mesh,
+                            self.splats["means"].detach(), camtoworlds_mesh,
                             method="camera",
                             gs_percentile=99,
                             gs_scale=1.1,
@@ -1797,6 +2182,7 @@ class Runner:
                         if dist.is_available() and dist.is_initialized():
                             dist.barrier()
 
+            _profile_mark("optimizer_start")
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
                 assert cfg.packed, "Sparse gradients only work with packed mode."
@@ -1852,6 +2238,7 @@ class Runner:
                 optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
                 scheduler.step()
+            _profile_mark("optimizer")
 
             # Run post-backward steps after backward and optimizer
             if isinstance(self.cfg.strategy, DefaultStrategy):
@@ -1874,6 +2261,15 @@ class Runner:
                 )
             else:
                 assert_never(self.cfg.strategy)
+
+            _enforce_gaussian_budget(
+                params=self.splats,
+                optimizers=self.optimizers,
+                state=self.strategy_state,
+                budget=scheduled_budget,
+                step=step,
+                phase="post_strategy",
+            )
 
             # MaskGaussian: periodic mask-based pruning
             # Following the paper: prune at every densification step during
@@ -1945,6 +2341,47 @@ class Runner:
                                     f"min={keep_prob.min().item():.4f}. "
                                     f"Now having {len(self.splats['means'])} Gaussians."
                                 )
+
+            if cfg.spatial_sort_step > 0 and step == cfg.spatial_sort_step:
+                if self.world_rank == 0:
+                    print(
+                        f"[Spatial Sort] Morton ordering {len(self.splats['means'])} Gaussians "
+                        f"at step {step}."
+                    )
+                order = _morton_order(self.splats["means"].detach())
+                _reorder_gaussians(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    order=order,
+                )
+
+            _profile_mark("step_end")
+            if profile_this_step:
+                profile_events["step_end"].synchronize()
+                timings = {
+                    "forward_ms": profile_events["ready"].elapsed_time(profile_events["forward"]),
+                    "losses_ms": profile_events["forward"].elapsed_time(profile_events["losses"]),
+                    "backward_ms": profile_events["losses"].elapsed_time(profile_events["backward"]),
+                    "pre_optimizer_ms": profile_events["backward"].elapsed_time(profile_events["optimizer_start"]),
+                    "optimizer_ms": profile_events["optimizer_start"].elapsed_time(profile_events["optimizer"]),
+                    "strategy_ms": profile_events["optimizer"].elapsed_time(profile_events["step_end"]),
+                }
+                timings["gpu_total_ms"] = profile_events["ready"].elapsed_time(profile_events["step_end"])
+                timings["wall_ms"] = (time.perf_counter() - step_wall_start) * 1000.0
+                timings["data_wall_ms"] = data_wall_ms
+                timings["num_gaussians"] = len(self.splats["means"])
+                if cfg.visible_adam:
+                    visible_count = int(visibility_mask.sum().item())
+                elif cfg.packed:
+                    visible_count = int(torch.unique(info["gaussian_ids"]).numel())
+                else:
+                    visible_count = int(
+                        (info["radii"] > 0).all(dim=-1).any(dim=0).sum().item()
+                    )
+                timings["visible_gaussians"] = visible_count
+                timings["tile_intersections"] = int(info["isect_ids"].numel())
+                print(f"[HYWorld2 Train Profile] step={step} {json.dumps(timings, sort_keys=True)}")
 
             # eval the full set
             if step in eval_steps:
