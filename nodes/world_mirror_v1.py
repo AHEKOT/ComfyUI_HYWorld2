@@ -2347,7 +2347,7 @@ class VNCCS_BackgroundPreview:
             "preview_file_size_mb": [preview_info["size_mb"]],
             "preview_format": [preview_format],
             "coordinate_basis": [frontend_coordinate_basis],
-            "basis_diagnostic_version": ["basis-diag-v5-root-basis-20260713"],
+            "basis_diagnostic_version": ["basis-diag-v6-fullscreen-preserve-20260713"],
         }
         
         # Add camera parameters if provided

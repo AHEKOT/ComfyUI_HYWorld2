@@ -262,19 +262,37 @@
 
         function setOrbitControlsFromCamera() {
             if (!camera || !canvas) return;
+            // OrbitControls' constructor performs an immediate update.  Its
+            // defaults are a 5-unit orbit around the origin, so constructing it
+            // before supplying the current camera state teleports the camera.
+            // Derive the complete orbit state first and pass it to the
+            // constructor, making the FPS -> Orbit transition position-stable.
+            const position = camera.position.clone();
+            const forward = getCameraForward();
+            const pivotDistance = Math.min(0.05, Math.max(0.005, getSceneMaxDim() * 0.002));
+            const target = new SPLAT.Vector3(
+                position.x + forward.x * pivotDistance,
+                position.y + forward.y * pivotDistance,
+                position.z + forward.z * pivotDistance
+            );
+            const azimuth = -Math.atan2(forward.x, forward.z);
+            const elevation = Math.atan2(
+                forward.y,
+                Math.hypot(forward.x, forward.z)
+            );
             if (controls && controls.dispose) {
                 controls.dispose();
             }
-            controls = new SPLAT.OrbitControls(camera, canvas);
-            controls.minZoom = 0.001;
-            const pivotDistance = Math.min(0.05, Math.max(0.005, getSceneMaxDim() * 0.002));
-            const forward = getCameraForward();
-            const target = new SPLAT.Vector3(
-                camera.position.x + forward.x * pivotDistance,
-                camera.position.y + forward.y * pivotDistance,
-                camera.position.z + forward.z * pivotDistance
+            controls = new SPLAT.OrbitControls(
+                camera,
+                canvas,
+                azimuth,
+                elevation,
+                pivotDistance,
+                true,
+                target
             );
-            controls.setCameraTarget(target);
+            controls.minZoom = 0.001;
             invalidateRender(800);
         }
 
@@ -1140,7 +1158,7 @@
             setFullscreenFlight(Boolean(document.fullscreenElement));
         });
 
-        const VIEWER_BASIS_DIAGNOSTIC_VERSION = 'basis-diag-v5-root-basis-20260713';
+        const VIEWER_BASIS_DIAGNOSTIC_VERSION = 'basis-diag-v6-fullscreen-preserve-20260713';
 
         // Listen for messages from parent
         window.addEventListener('message', (event) => {
